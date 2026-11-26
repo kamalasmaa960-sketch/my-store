@@ -211,7 +211,7 @@ async function shopLayout(c, title, body, seo = {}) {
   const origin = c.url.origin; const canon = origin + (seo.path || '/');
   const logo = setting(c, 'logo');
   const logoSrc = logo ? (logo.startsWith('data:') ? '/logo?v=' + logo.length : logo) : '';
-  let head = `<meta name="description" content="${esc(desc)}">`;
+  let head = `<meta name="google-site-verification" content="gpHTQRnrJTEDqKe-RgngkJezTttPl6spQQbdAjeDRyk"><meta name="description" content="${esc(desc)}">`;
   if (setting(c, 'seo_keywords')) head += `<meta name="keywords" content="${esc(setting(c, 'seo_keywords'))}">`;
   if (seo.noindex) head += '<meta name="robots" content="noindex,follow">';
   head += `<link rel="canonical" href="${esc(canon)}"><meta property="og:type" content="${seo.jsonld ? 'product' : 'website'}"><meta property="og:locale" content="ar_AR"><meta property="og:site_name" content="${esc(store)}"><meta property="og:title" content="${esc(full)}"><meta property="og:description" content="${esc(desc)}"><meta property="og:url" content="${esc(canon)}">`;
@@ -586,6 +586,11 @@ const DELS = {
     sel: async (db, id) => { const r = await db.prepare('SELECT name,username FROM drivers WHERE id=?').bind(id).first(); return r && { label: `${r.name} (${r.username})`, warn: [`${await cnt(db, 'SELECT COUNT(*) FROM orders WHERE driver_id=?', id)} طلب معيّن عليه هيتفك التعيين عنهم (الطلبات نفسها مش هتتحذف).`, 'دخوله هيتقفل فورا.'] }; },
     run: (db, id) => [db.prepare('UPDATE orders SET driver_id=NULL WHERE driver_id=?').bind(id), db.prepare("DELETE FROM sessions WHERE kind='driver' AND uid=?").bind(id), db.prepare('DELETE FROM drivers WHERE id=?').bind(id)],
   },
+  visits: {
+    title: 'كل بيانات الزوار', back: '/admin/reports',
+    sel: async (db, id) => ({ label: 'تصفير عدّاد الزوار', warn: [`هيتمسح ${await cnt(db, 'SELECT COUNT(*) FROM visits')} سجل زيارة نهائيا وعدّاد الزوار هيرجع صفر.`, 'المبيعات والطلبات والمرتجعات مش هتتأثر.', 'بعد كده كل جهاز بيتحسب مرة واحدة في اليوم زي الأول.'] }),
+    run: (db) => [db.prepare('DELETE FROM visits')],
+  },
   box: {
     title: 'لافتة', back: '/admin/boxes',
     sel: async (db, id) => { const r = await db.prepare('SELECT body FROM boxes WHERE id=?').bind(id).first(); return r && { label: String(r.body).slice(0, 80), warn: ['هتختفي من الموقع.'] }; },
@@ -830,14 +835,16 @@ async function admin(c) {
   // ----- التقارير -----
   if (path === '/admin/reports') {
     const today = cairoNow().slice(0, 10); const days = {};
-    for (let i = 0; i < 30; i++) days[dayAdd(today, -i)] = { v: 0, o: 0, s: 0, r: 0 };
+    for (let i = 0; i < 30; i++) days[dayAdd(today, -i)] = { v: 0, o: 0, s: 0, r: 0, l: 0 };
     const from = dayAdd(today, -29);
     for (const r of (await db.prepare('SELECT day, COUNT(*) c FROM visits WHERE day>=? GROUP BY day').bind(from).all()).results) if (days[r.day]) days[r.day].v = r.c;
     for (const r of (await db.prepare("SELECT SUBSTR(created_at,1,10) d, COUNT(*) c, SUM(total) t FROM orders WHERE status<>'cancelled' AND created_at>=? GROUP BY SUBSTR(created_at,1,10)").bind(from).all()).results) if (days[r.d]) { days[r.d].o = r.c; days[r.d].s = r.t; }
+    for (const r of (await db.prepare("SELECT SUBSTR(created_at,1,10) d, SUM(total) t FROM orders WHERE status IN ('cancelled','failed') AND created_at>=? GROUP BY SUBSTR(created_at,1,10)").bind(from).all()).results) if (days[r.d]) days[r.d].l = r.t;
     for (const r of (await db.prepare("SELECT SUBSTR(created_at,1,10) d, SUM(amount) t FROM returns WHERE status='approved' AND created_at>=? GROUP BY SUBSTR(created_at,1,10)").bind(from).all()).results) if (days[r.d]) days[r.d].r = r.t;
     const tot = (k) => Object.values(days).reduce((a, x) => a + x[k], 0);
     const sumAll = await cnt(db, "SELECT COALESCE(SUM(total),0) FROM orders WHERE status<>'cancelled'"), retAll = await cnt(db, "SELECT COALESCE(SUM(amount),0) FROM returns WHERE status='approved'"), visAll = await cnt(db, 'SELECT COUNT(*) FROM visits');
     const t = days[today];
+    const active = Object.entries(days).filter(([d, r]) => d <= today && (r.v > 0 || r.o > 0 || r.s > 0 || r.r > 0 || r.l > 0));
     const lossQ = async (where, bind) => { const r = await db.prepare(`SELECT COUNT(*) n, COALESCE(SUM(total),0) t FROM orders WHERE ${where}`).bind(...bind).first(); return { n: r.n, t: r.t }; };
     const retQ = async (bind, extra) => { const r = await db.prepare(`SELECT COUNT(*) n, COALESCE(SUM(amount),0) t FROM returns WHERE status='approved' ${extra}`).bind(...bind).first(); return { n: r.n, t: r.t }; };
     const L30 = { ret: await retQ([from], 'AND created_at>=?'), can: await lossQ("status='cancelled' AND created_at>=?", [from]), fail: await lossQ("status='failed' AND created_at>=?", [from]) };
@@ -845,7 +852,7 @@ async function admin(c) {
     const lrow = (name, k, link) => `<tr><td>${link ? `<a href="${link}">${name}</a>` : name}</td><td>${L30[k].n}</td><td>${money(L30[k].t)}</td><td>${LAll[k].n}</td><td>${money(LAll[k].t)}</td></tr>`;
     const tot30 = L30.ret.t + L30.can.t + L30.fail.t, totAll = LAll.ret.t + LAll.can.t + LAll.fail.t;
     const losses = `<div class="box" style="margin-top:18px"><h3>الخسائر</h3><div class="stats"><div class="stat"><b>${money(tot30)}</b>إجمالي الخسائر آخر 30 يوم</div><div class="stat"><b>${money(totAll)}</b>إجمالي الخسائر كل الفترة</div></div><div class="tbl-wrap"><table><tr><th>النوع</th><th>العدد (30 يوم)</th><th>القيمة (30 يوم)</th><th>العدد (الكل)</th><th>القيمة (الكل)</th></tr>${lrow('مرتجعات مقبولة', 'ret', '/admin/returns')}${lrow('طلبات ملغية', 'can', '/admin/orders')}${lrow('طلبات تعذر تسليمها', 'fail', '/admin/orders')}<tr><th>الإجمالي</th><th>${L30.ret.n + L30.can.n + L30.fail.n}</th><th>${money(tot30)}</th><th>${LAll.ret.n + LAll.can.n + LAll.fail.n}</th><th>${money(totAll)}</th></tr></table></div><p class="muted">الخسائر هنا هي قيمة البيع الضايع: مرتجعات اتقبلت + طلبات اتلغت + طلبات تعذر تسليمها (لسه ما اتحولتش لملغي أو مرتجع). مش بتحسب تكلفة البضاعة لأن سعر الشراء مش مسجل في المنتجات.</p></div>`;
-    return A('التقارير', `<h2>التقارير</h2><div class="stats"><div class="stat"><b>${t.v}</b>زوار اليوم</div><div class="stat"><b>${tot('v')}</b>زوار آخر 30 يوم</div><div class="stat"><b>${money(t.s)}</b>مبيعات اليوم</div><div class="stat"><b>${money(tot('s'))}</b>مبيعات آخر 30 يوم</div><div class="stat"><b>${money(tot('r'))}</b>مرتجعات آخر 30 يوم</div><div class="stat"><b>${money(tot('s') - tot('r'))}</b>الصافي آخر 30 يوم</div></div>${losses}<p class="muted">كل الفترة: زيارات ${visAll} (جهاز/يوم) - مبيعات ${money(sumAll)} - مرتجعات ${money(retAll)} - صافي ${money(sumAll - retAll)}</p><div class="tbl-wrap"><table><tr><th>اليوم</th><th>الزوار</th><th>الطلبات</th><th>المبيعات</th><th>المرتجعات</th><th>الصافي</th></tr>${Object.entries(days).map(([d, r]) => `<tr><td>${d}</td><td>${r.v}</td><td>${r.o}</td><td>${money(r.s)}</td><td>${money(r.r)}</td><td>${money(r.s - r.r)}</td></tr>`).join('')}</table></div><p class="muted">الزائر بيتحسب مرة واحدة في اليوم لكل جهاز/متصفح (بكوكي). لو العميل مسح الكوكيز أو استخدم متصفح تاني بيتحسب تاني. الزحف الآلي (زي بوتات جوجل) مش محسوب. المبيعات مش بتشمل الطلبات الملغية، والمرتجعات المحسوبة هي المقبولة بس.</p>`);
+    return A('التقارير', `<h2>التقارير</h2><div class="stats"><div class="stat"><b>${t.v}</b>زوار اليوم</div><div class="stat"><b>${tot('v')}</b>زوار آخر 30 يوم</div><div class="stat"><b>${money(t.s)}</b>مبيعات اليوم</div><div class="stat"><b>${money(tot('s'))}</b>مبيعات آخر 30 يوم</div><div class="stat"><b>${money(tot('r'))}</b>مرتجعات آخر 30 يوم</div><div class="stat"><b>${money(tot('s') - tot('r'))}</b>الصافي آخر 30 يوم</div></div>${losses}<p><a class="btn sm red" href="/admin/confirm?t=visits&id=1">تصفير الزوار</a></p><p class="muted">كل الفترة: زيارات ${visAll} (جهاز/يوم) - مبيعات ${money(sumAll)} - مرتجعات ${money(retAll)} - صافي ${money(sumAll - retAll)}</p><p class="muted">الجدول بيعرض الأيام اللي فيها نشاط بس (آخر 30 يوم).</p><div class="tbl-wrap"><table><tr><th>اليوم</th><th>الزوار</th><th>الطلبات</th><th>المبيعات</th><th>المرتجعات</th><th>ملغي/تعذر</th><th>الصافي</th></tr>${active.map(([d, r]) => `<tr><td>${d}</td><td>${r.v}</td><td>${r.o}</td><td>${money(r.s)}</td><td>${money(r.r)}</td><td>${money(r.l)}</td><td>${money(r.s - r.r)}</td></tr>`).join('') || '<tr><td colspan="7" class="muted">مفيش نشاط مسجل لسه.</td></tr>'}</table></div><p class="muted">الزائر بيتحسب مرة واحدة في اليوم لكل جهاز/متصفح (بكوكي). لو العميل مسح الكوكيز أو استخدم متصفح تاني بيتحسب تاني. الزحف الآلي (زي بوتات جوجل) مش محسوب. المبيعات مش بتشمل الطلبات الملغية، والمرتجعات المحسوبة هي المقبولة بس.</p>`);
   }
 
   // ----- اللافتات -----
