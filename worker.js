@@ -46,7 +46,11 @@ async function ensureSchema(db) {
     t("CREATE TABLE IF NOT EXISTS boxes (id INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT NOT NULL, bg_color TEXT NOT NULL, text_color TEXT NOT NULL, position TEXT NOT NULL, link TEXT NOT NULL DEFAULT '', active INTEGER NOT NULL DEFAULT 1, sort_order INTEGER NOT NULL DEFAULT 0)"),
     t('CREATE TABLE IF NOT EXISTS payment_methods (id INTEGER PRIMARY KEY AUTOINCREMENT, label TEXT NOT NULL, number TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1)'),
     t("CREATE TABLE IF NOT EXISTS contacts (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, value TEXT NOT NULL, label TEXT NOT NULL DEFAULT '', sort_order INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1)"),
+    t("CREATE TABLE IF NOT EXISTS customers (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, phone TEXT NOT NULL UNIQUE, phone2 TEXT NOT NULL DEFAULT '', address TEXT NOT NULL DEFAULT '', pass_hash TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL DEFAULT '')"),
+    t('CREATE TABLE IF NOT EXISTS cart_items (customer_id INTEGER NOT NULL, product_id INTEGER NOT NULL, qty INTEGER NOT NULL, PRIMARY KEY (customer_id, product_id))'),
   ]);
+  try { await db.prepare('ALTER TABLE orders ADD COLUMN customer_id INTEGER').run(); } catch (e) { /* العمود موجود */ }
+  for (const col of ['google_sub TEXT', 'email TEXT']) { try { await db.prepare('ALTER TABLE customers ADD COLUMN ' + col).run(); } catch (e) { /* موجود */ } }
   schemaReady = true;
 }
 const cnt = async (db, sql, ...b) => { const r = await db.prepare(sql).bind(...b).first(); return r ? Number(Object.values(r)[0]) || 0 : 0; };
@@ -166,8 +170,21 @@ async function trackVisit(c) {
 }
 
 // ---------- السلة (كوكي) ----------
-function readCart(req) { try { const o = JSON.parse(getCookie(req, 'cart') || '{}'); const k = {}; for (const [a, b] of Object.entries(o)) { const id = parseInt(a), q = parseInt(b); if (id > 0 && q > 0) k[id] = Math.min(q, 99); } return k; } catch { return {}; } }
-const cartCookie = (c, cart) => setCookie(c, 'cart', JSON.stringify(cart), 60 * 60 * 24 * 14, false);
+async function loadCart(c, cust) {
+  const k = {}; if (!cust) return k;
+  for (const r of (await c.db.prepare('SELECT product_id,qty FROM cart_items WHERE customer_id=?').bind(cust.id).all()).results) k[r.product_id] = Math.min(99, r.qty);
+  return k;
+}
+async function saveCart(c, cust, cart) {
+  const st = [c.db.prepare('DELETE FROM cart_items WHERE customer_id=?').bind(cust.id)];
+  for (const [id, q] of Object.entries(cart)) if (+id > 0 && q > 0) st.push(c.db.prepare('INSERT INTO cart_items (customer_id,product_id,qty) VALUES (?,?,?)').bind(cust.id, +id, Math.min(99, q)));
+  await c.db.batch(st);
+}
+async function getCustomer(c) {
+  const sess = await getSession(c, 'csid', 'cust'); if (!sess) return null;
+  const u = await c.db.prepare('SELECT * FROM customers WHERE id=? AND active=1').bind(sess.uid).first();
+  return u ? { ...u, csrf: sess.csrf, token_hash: sess.token_hash } : null;
+}
 const PCOLS = "id,name,price,stock,image_url,img_v,(image_data IS NOT NULL AND image_data<>'') AS has_img";
 async function cartItems(db, cart) {
   const ids = Object.keys(cart).map(Number); if (!ids.length) return { items: [], total: 0 };
@@ -198,7 +215,7 @@ async function shopLayout(c, title, body, seo = {}) {
   if (ld) head += `<script type="application/ld+json">${JSON.stringify(ld).replace(/</g, '\\u003c')}</script>`;
   const col = (k, d) => (colorOk(setting(c, k, d)) ? setting(c, k, d) : d);
   const radius = Math.max(0, Math.min(30, parseInt(setting(c, 'radius', '12')) || 12));
-  const cartN = Object.values(readCart(c.req)).reduce((a, b) => a + b, 0);
+  const cartN = c.cust ? await cnt(c.db, 'SELECT COALESCE(SUM(qty),0) FROM cart_items WHERE customer_id=?', c.cust.id) : 0;
   const brand = (logoSrc ? `<img class="logo" src="${esc(logoSrc)}" alt=""> ` : '') + `<span>${esc(store)}</span>`;
   const q = c.url.searchParams.get('s') || '';
   const top = await renderBoxes(c, 'top');
@@ -212,10 +229,10 @@ async function shopLayout(c, title, body, seo = {}) {
   foot += `</div><div class="copy">© ${new Date().getFullYear()} ${esc(store)}`;
   if (c.path === '/' && setting(c, 'show_admin_link', '1') === '1') foot += ` &nbsp;·&nbsp; <a class="adminlink" href="/admin">${icon('lock', 14)} دخول الإدارة</a>`;
   foot += '</div></footer>';
-  return html(`<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(full)}</title>${head}<link rel="stylesheet" href="/style.css?v=${CSS.length}"><style>:root{--primary:${col('c_primary', '#5b3df5')};--bg:${col('c_bg', '#f6f7fb')};--head:${col('c_head', '#ffffff')};--text:${col('c_text', '#1f2430')};--radius:${radius}px}</style></head><body class="shop">${top}<header class="top"><div class="bar"><a class="brand" href="/">${brand}</a><form class="search" action="/"><input name="s" placeholder="ابحث عن منتج" value="${esc(q)}"><button aria-label="بحث">${icon('search', 18)}</button></form><nav class="nav"><a href="/driver/login">${icon('user', 20)}<span>الموظفين</span></a><a href="/return">${icon('return', 20)}<span>مرتجع</span></a><a class="cartlink" href="/cart">${icon('cart', 22)}<span>السلة</span>${cartN ? `<b class="pill">${cartN}</b>` : ''}</a></nav></div></header><main class="wrap">${flash ? `<div class="notice">${esc(flash)}</div>` : ''}${body}</main>${footerBoxes}${foot}</body></html>`, seo.status || 200);
+  return html(`<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(full)}</title>${head}<link rel="stylesheet" href="/style.css?v=${CSS.length}"><style>:root{--primary:${col('c_primary', '#5b3df5')};--bg:${col('c_bg', '#f6f7fb')};--head:${col('c_head', '#ffffff')};--text:${col('c_text', '#1f2430')};--radius:${radius}px}</style></head><body class="shop">${top}<header class="top"><div class="bar"><a class="brand" href="/">${brand}</a><form class="search" action="/"><input name="s" placeholder="ابحث عن منتج" value="${esc(q)}"><button aria-label="بحث">${icon('search', 18)}</button></form><nav class="nav"><a href="${c.cust ? '/account' : '/account/login'}">${icon('user', 20)}<span>${c.cust ? esc(c.cust.name.split(' ')[0]) : 'دخول / تسجيل'}</span></a><a href="/driver/login">${icon('truck', 20)}<span>الموظفين</span></a><a href="/return">${icon('return', 20)}<span>مرتجع</span></a><a class="cartlink" href="/cart">${icon('cart', 22)}<span>السلة</span>${cartN ? `<b class="pill">${cartN}</b>` : ''}</a></nav></div></header><main class="wrap">${flash ? `<div class="notice">${esc(flash)}</div>` : ''}${body}</main>${footerBoxes}${foot}</body></html>`, seo.status || 200);
 }
 
-const ADMIN_NAV = [['/admin', 'الرئيسية', 'home'], ['/admin/products', 'المنتجات', 'box'], ['/admin/categories', 'الأقسام', 'grid'], ['/admin/orders', 'الطلبات', 'list'], ['/admin/returns', 'المرتجعات', 'return'], ['/admin/drivers', 'الموظفين', 'truck'], ['/admin/reports', 'التقارير', 'chart'], ['/admin/boxes', 'اللافتات', 'image'], ['/admin/settings', 'الشكل والإعدادات', 'sliders'], ['/admin/payments', 'الدفع والتواصل', 'card'], ['/admin/account', 'حسابي', 'shield']];
+const ADMIN_NAV = [['/admin', 'الرئيسية', 'home'], ['/admin/products', 'المنتجات', 'box'], ['/admin/categories', 'الأقسام', 'grid'], ['/admin/orders', 'الطلبات', 'list'], ['/admin/returns', 'المرتجعات', 'return'], ['/admin/drivers', 'الموظفين', 'truck'], ['/admin/customers', 'العملاء', 'user'], ['/admin/reports', 'التقارير', 'chart'], ['/admin/boxes', 'اللافتات', 'image'], ['/admin/settings', 'الشكل والإعدادات', 'sliders'], ['/admin/payments', 'الدفع والتواصل', 'card'], ['/admin/account', 'حسابي', 'shield']];
 function adminLayout(c, title, body, status = 200) {
   const store = sname(c); const flash = c.url.searchParams.get('m');
   const nav = ADMIN_NAV.map(([h, l, i]) => `<a href="${h}" class="${c.path === h ? 'on' : ''}">${icon(i, 18)}<span>${l}</span></a>`).join('');
@@ -246,7 +263,7 @@ async function shop(c) {
     const grid = prods.length ? `<div class="grid">${prods.map((p) => `<div class="card">${p.stock <= 0 ? '<span class="ribbon">غير متاح</span>' : ''}<a class="im" href="/p/${p.id}"><img src="${esc(imgSrc(p))}" alt="${esc(p.name)}" loading="lazy"></a><div class="b"><a class="nm" href="/p/${p.id}">${esc(p.name)}</a><span class="price">${money(p.price)}</span>${p.stock > 0 ? `<form method="post" action="/cart/add"><input type="hidden" name="id" value="${p.id}"><button class="sm">${icon('cart', 16)} أضف للسلة</button></form>` : ''}</div></div>`).join('')}</div>` : '<p class="muted">مفيش منتجات دلوقتي.</p>';
     return L('الرئيسية', (await renderBoxes(c, 'home_top')) + hero + chips + `<div id="products" class="sec-title"><h3>${s ? 'نتائج البحث' : 'المنتجات'}</h3><span class="muted">${prods.length} منتج</span></div>` + grid + (await renderBoxes(c, 'home_bottom')), { path: '/', noindex: !!(s || cat) });
   }
-  if (path === '/robots.txt') return new Response(`User-agent: *\nDisallow: /admin\nDisallow: /driver\nDisallow: /cart\nDisallow: /checkout\nDisallow: /return\nSitemap: ${url.origin}/sitemap.xml\n`, { headers: { 'content-type': 'text/plain;charset=utf-8' } });
+  if (path === '/robots.txt') return new Response(`User-agent: *\nDisallow: /admin\nDisallow: /driver\nDisallow: /cart\nDisallow: /checkout\nDisallow: /return\nDisallow: /account\nSitemap: ${url.origin}/sitemap.xml\n`, { headers: { 'content-type': 'text/plain;charset=utf-8' } });
   if (path === '/sitemap.xml') {
     const ps = (await db.prepare('SELECT id FROM products WHERE active=1 ORDER BY id DESC LIMIT 2000').all()).results;
     return new Response(`<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><url><loc>${url.origin}/</loc></url>${ps.map((p) => `<url><loc>${url.origin}/p/${p.id}</loc></url>`).join('')}</urlset>`, { headers: { 'content-type': 'application/xml;charset=utf-8' } });
@@ -270,12 +287,15 @@ async function shop(c) {
     const ld = { '@context': 'https://schema.org', '@type': 'Product', name: p.name, description: String(p.description || p.name).slice(0, 300), image: img.startsWith('http') ? img : url.origin + img, offers: { '@type': 'Offer', priceCurrency: 'EGP', price: Number(p.price).toFixed(2), availability: p.stock > 0 ? 'https://schema.org/InStock' : 'https://schema.org/OutOfStock', url: url.origin + '/p/' + p.id } };
     return L(p.name, body, { path: '/p/' + p.id, desc: String(p.description || '').slice(0, 160) || undefined, image: img.startsWith('http') ? img : url.origin + img, jsonld: ld });
   }
-  const cart = readCart(req);
+  if (path.startsWith('/account')) return account(c);
+  const cust = c.cust;
+  if (!cust && (path.startsWith('/cart') || path === '/checkout')) return redirect('/account/login?next=' + encodeURIComponent(path === '/cart/add' || path === '/cart/update' ? '/cart' : path));
+  const cart = cust ? await loadCart(c, cust) : {};
   if (path === '/cart/add' && form) {
     const id = parseInt(form.get('id')), q = Math.max(1, parseInt(form.get('qty') || '1') || 1);
     const ok = await db.prepare('SELECT id FROM products WHERE id=? AND active=1 AND stock>0').bind(id).first();
     if (ok) cart[id] = Math.min(99, (cart[id] || 0) + q);
-    cartCookie(c, cart);
+    await saveCart(c, cust, cart);
     const ref = req.headers.get('referer'); let to = '/cart';
     try { if (ref && new URL(ref).origin === url.origin) to = new URL(ref).pathname + new URL(ref).search; } catch {}
     return redirect(to);
@@ -284,7 +304,7 @@ async function shop(c) {
     const rm = form.get('remove');
     if (rm) delete cart[parseInt(rm)];
     else for (const [k, v] of form.entries()) { const mm = k.match(/^qty_(\d+)$/); if (mm) { const n = parseInt(v); if (n > 0) cart[+mm[1]] = Math.min(n, 99); else delete cart[+mm[1]]; } }
-    cartCookie(c, cart);
+    await saveCart(c, cust, cart);
     return redirect('/cart');
   }
   if (path === '/cart') {
@@ -293,10 +313,11 @@ async function shop(c) {
     return L('السلة', bx + `<h2>سلة المشتريات</h2><form method="post" action="/cart/update"><div class="tbl-wrap"><table><tr><th></th><th>المنتج</th><th>السعر</th><th>الكمية</th><th>الإجمالي</th><th></th></tr>${items.map((r) => `<tr><td><img class="thumb" src="${esc(imgSrc(r))}" alt=""></td><td>${esc(r.name)}</td><td>${money(r.price)}</td><td><input type="number" min="0" max="${r.stock}" name="qty_${r.id}" value="${r.qty}" style="width:80px"></td><td>${money(r.line)}</td><td><button class="sm red" name="remove" value="${r.id}">حذف</button></td></tr>`).join('')}</table></div><p><b>الإجمالي: ${money(total)}</b></p><button class="gray">تحديث الكميات</button> <a class="btn" href="/checkout">إتمام الطلب</a></form>`, { noindex: true });
   }
   if (path === '/checkout') {
+    if (!hasPhone(cust)) return redirect('/account/phone?next=/checkout');
     const { items, total } = await cartItems(db, cart);
     if (!items.length) return redirect('/cart');
     const pms = (await db.prepare('SELECT * FROM payment_methods WHERE active=1 ORDER BY id').all()).results;
-    let err = ''; const g = (k) => (form ? str(form.get(k), 500) : '');
+    let err = ''; const g = (k) => (form ? str(form.get(k), 500) : ({ name: cust.name, phone: cust.phone, phone2: cust.phone2, address: cust.address }[k] || ''));
     if (form) {
       if (!pubCheck(c)) err = 'الصفحة انتهت، حدّثيها وحاولي تاني.';
       else {
@@ -306,7 +327,7 @@ async function shop(c) {
         const phOk = (x) => /^[0-9+\s-]{8,20}$/.test(x);
         if (n.split(/\s+/).filter(Boolean).length < 2 || !ad || !phOk(ph) || (ph2 && !phOk(ph2))) err = 'اكتبي الاسم بالكامل (اسمين على الأقل)، ورقم تليفون صحيح، والعنوان بالتفصيل.';
         else {
-          const ins = await db.prepare('INSERT INTO orders (customer_name,phone,phone2,location,address,notes,total,payment_method,created_at) VALUES (?,?,?,?,?,?,?,?,?)').bind(n, ph, ph2, loc, ad, nt, total, pmname, cairoNow()).run();
+          const ins = await db.prepare('INSERT INTO orders (customer_name,phone,phone2,location,address,notes,total,payment_method,created_at,customer_id) VALUES (?,?,?,?,?,?,?,?,?,?)').bind(n, ph, ph2, loc, ad, nt, total, pmname, cairoNow(), cust.id).run();
           const oid = ins.meta.last_row_id; const done = []; let failed = null;
           for (const r of items) {
             const u = await db.prepare('UPDATE products SET stock=stock-? WHERE id=? AND stock>=?').bind(r.qty, r.id, r.qty).run();
@@ -319,7 +340,7 @@ async function shop(c) {
             err = `الكمية المتاحة من "${failed}" مش كفاية.`;
           } else {
             await db.batch(items.map((r) => db.prepare('INSERT INTO order_items (order_id,product_id,name,price,qty) VALUES (?,?,?,?,?)').bind(oid, r.id, r.name, r.price, r.qty)));
-            setCookie(c, 'cart', '{}', 0, false); setCookie(c, 'lo', String(oid), 3600);
+            await db.prepare('DELETE FROM cart_items WHERE customer_id=?').bind(cust.id).run(); if (!cust.address) await db.prepare('UPDATE customers SET address=?, phone2=? WHERE id=?').bind(ad, ph2, cust.id).run(); setCookie(c, 'lo', String(oid), 3600);
             return redirect('/thanks');
           }
         }
@@ -389,6 +410,139 @@ async function driverArea(c) {
     cards += `<div class="box"><b>طلب #${o.id}</b> <span class="badge">${esc(ORDER_LABELS[o.status] || o.status)}</span><p>${icon('user', 16)} <b>${esc(o.customer_name)}</b><br>${icon('phone', 16)} <a href="tel:${esc(o.phone)}" dir="ltr">${esc(o.phone)}</a>${o.phone2 ? ` &nbsp; <a href="tel:${esc(o.phone2)}" dir="ltr">${esc(o.phone2)}</a>` : ''}<br>${nl2br(o.address)}${o.location && !/^https?:\/\//i.test(o.location) ? `<br>الموقع: ${esc(o.location)}` : ''}<br><a class="btn sm" target="_blank" rel="noopener" href="${esc(mapLink(o))}">فتح على الخريطة</a>${o.notes ? `<br><span class="muted">ملاحظات: ${esc(o.notes)}</span>` : ''}</p><p class="muted">وقت الطلب: ${esc(o.created_at)}<br>موعد التوصيل: <b>${o.delivery_time ? esc(o.delivery_time) : 'لسه ما اتحددش'}</b></p><p>المنتجات (${its.length} منتج، ${its.reduce((a, i) => a + i.qty, 0)} قطعة):</p><ul>${its.map((i) => `<li>${esc(i.name)} × ${i.qty} = ${money(i.price * i.qty)}</li>`).join('')}</ul><p>السعر الإجمالي: <b>${money(o.total)}</b></p><p><b>المطلوب تحصيله: ${o.payment_method === 'الدفع عند الاستلام' ? money(o.total) : 'مدفوع بالتحويل (' + esc(o.payment_method) + ')'}</b></p><form method="post">${csrf}<input type="hidden" name="id" value="${o.id}"><input name="note" placeholder="ملاحظة (اختياري)" value="${esc(o.driver_note)}"><p style="display:flex;gap:8px;flex-wrap:wrap">${o.status !== 'shipped' ? '<button name="act" value="out" class="sm gray">خرجت للتوصيل</button>' : ''}<button name="act" value="done" class="sm">تم التسليم</button><button name="act" value="fail" class="sm red">تعذر التسليم</button></p></form></div>`;
   }
   return L('طلباتي', `<h2>أهلا ${esc(me.name)} <a class="btn sm gray" href="/driver/logout">خروج</a></h2><h3>طلبات للتوصيل (${open.length})</h3>${open.length ? '' : '<p class="muted">مفيش طلبات متسلمة ليك دلوقتي.</p>'}${cards}${done.length ? `<h3>آخر الطلبات المسلّمة</h3><div class="tbl-wrap"><table>${done.map((o) => `<tr><td>#${o.id}</td><td>${esc(o.customer_name)}</td><td>${money(o.total)}</td><td>${esc(o.delivered_at)}</td></tr>`).join('')}</table></div>` : ''}`);
+}
+
+// ---------- حسابات العملاء ----------
+const phoneNorm = (p) => String(p || '').replace(/[^0-9+]/g, '');
+const phoneOk = (p) => /^\+?[0-9]{8,15}$/.test(p);
+const hasPhone = (u) => !String(u.phone).startsWith('g:');
+const b64urlJson = (t) => JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(t.replace(/-/g, '+').replace(/_/g, '/').padEnd(Math.ceil(t.length / 4) * 4, '=')), (ch) => ch.charCodeAt(0))));
+const googleOn = (c) => !!(c.env.GOOGLE_CLIENT_ID && c.env.GOOGLE_CLIENT_SECRET);
+const googleBtn = (c, nq) => (googleOn(c) ? `<p style="text-align:center;margin:14px 0 0"><a class="btn gray" style="display:block" href="/account/google${nq}">الدخول بحساب Google</a></p>` : '');
+const safeNext = (n) => (/^\/(?!\/)[A-Za-z0-9_\-\/.?=&%]*$/.test(n || '') ? n : '/account');
+async function account(c) {
+  const { db, path, form, url } = c; const cust = c.cust;
+  const L = (t, b) => shopLayout(c, t, b, { noindex: true });
+  const next = safeNext((form && form.get('next')) || url.searchParams.get('next') || '');
+  const nextF = `<input type="hidden" name="next" value="${esc(next)}">`;
+  const nq = next !== '/account' ? '?next=' + encodeURIComponent(next) : '';
+
+
+  if (path === '/account/google') {
+    if (!googleOn(c)) return redirect('/account/login');
+    const state = randToken(), nonce = randToken();
+    setCookie(c, 'gst', state, 600); setCookie(c, 'gnc', nonce, 600); setCookie(c, 'gnx', next, 600);
+    const q = new URLSearchParams({ client_id: c.env.GOOGLE_CLIENT_ID, redirect_uri: url.origin + '/account/google/callback', response_type: 'code', scope: 'openid email profile', state, nonce, prompt: 'select_account' });
+    return redirect((c.env.GOOGLE_AUTH_URL || 'https://accounts.google.com/o/oauth2/v2/auth') + '?' + q);
+  }
+  if (path === '/account/google/callback') {
+    const fail = (m) => { for (const k of ['gst', 'gnc', 'gnx']) setCookie(c, k, '', 0); return back('/account/login', m); };
+    if (!googleOn(c)) return redirect('/account/login');
+    const st = getCookie(c.req, 'gst'), nonce = getCookie(c.req, 'gnc'), nx = safeNext(getCookie(c.req, 'gnx'));
+    const code = url.searchParams.get('code') || '';
+    if (!st || url.searchParams.get('state') !== st || !code) return fail('تعذر الدخول بحساب Google، جربي تاني.');
+    let p;
+    try {
+      const tr = await fetch(c.env.GOOGLE_TOKEN_URL || 'https://oauth2.googleapis.com/token', { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ code, client_id: c.env.GOOGLE_CLIENT_ID, client_secret: c.env.GOOGLE_CLIENT_SECRET, redirect_uri: url.origin + '/account/google/callback', grant_type: 'authorization_code' }) });
+      const tj = await tr.json(); if (!tr.ok || !tj.id_token) throw new Error('token');
+      p = b64urlJson(tj.id_token.split('.')[1]);
+    } catch (e) { return fail('تعذر الدخول بحساب Google، جربي تاني.'); }
+    const issOk = p.iss === 'https://accounts.google.com' || p.iss === 'accounts.google.com' || !!c.env.GOOGLE_TOKEN_URL;
+    if (!issOk || p.aud !== c.env.GOOGLE_CLIENT_ID || !(p.exp * 1000 > Date.now()) || !nonce || p.nonce !== nonce || !p.sub || p.email_verified !== true) return fail('تعذر التحقق من حساب Google.');
+    let u = await db.prepare('SELECT * FROM customers WHERE google_sub=?').bind(String(p.sub)).first();
+    if (!u) {
+      const nm = str(p.name || String(p.email || '').split('@')[0] || 'عميل', 100);
+      const r = await db.prepare("INSERT INTO customers (name,phone,pass_hash,created_at,google_sub,email) VALUES (?,?,'!',?,?,?)").bind(nm, 'g:' + p.sub, cairoNow(), String(p.sub), str(p.email, 200)).run();
+      u = { id: r.meta.last_row_id, active: 1 };
+    }
+    if (!u.active) return fail('الحساب موقوف.');
+    for (const k of ['gst', 'gnc', 'gnx']) setCookie(c, k, '', 0);
+    await startSession(c, 'csid', 'cust', u.id);
+    return redirect(nx);
+  }
+  if (path === '/account/register') {
+    if (cust) return redirect(next);
+    let err = '';
+    if (form) {
+      const n = str(form.get('name'), 100), ph = phoneNorm(form.get('phone')), p = String(form.get('password') || '');
+      if (!pubCheck(c)) err = 'الصفحة انتهت، حدّثيها وحاولي تاني.';
+      else if (await loginBlocked(c, 'reg', ph || 'x')) err = 'محاولات كتير. استني 10 دقايق.';
+      else {
+        await loginFail(c, 'reg', ph || 'x');
+        if (n.split(/\s+/).filter(Boolean).length < 2) err = 'اكتبي اسمك بالكامل (اسمين على الأقل).';
+        else if (!phoneOk(ph)) err = 'رقم التليفون مش صحيح.';
+        else if (!passOkStaff(p) || /^(.)\1+$/.test(p)) err = 'كلمة السر 8 حروف على الأقل وفيها حروف وأرقام.';
+        else if (p !== String(form.get('password2') || '')) err = 'كلمتا السر مش متطابقتين.';
+        else if (await cnt(db, 'SELECT COUNT(*) FROM customers WHERE phone=?', ph)) err = 'الرقم ده مسجل قبل كده، سجلي دخول.';
+        else {
+          const r = await db.prepare('INSERT INTO customers (name,phone,pass_hash,created_at) VALUES (?,?,?,?)').bind(n, ph, await hashPass(c, p), cairoNow()).run();
+          await startSession(c, 'csid', 'cust', r.meta.last_row_id);
+          return redirect(next);
+        }
+      }
+    }
+    const fv = (k) => esc(form ? form.get(k) : '');
+    return L('حساب جديد', `<div class="box narrow"><h2>إنشاء حساب</h2>${err ? notice(err) : ''}<form method="post">${pubField(c)}${nextF}<label>الاسم بالكامل</label><input name="name" required value="${fv('name')}" autocomplete="name"><label>رقم التليفون (هو اللي هتدخلي بيه)</label><input name="phone" required dir="ltr" value="${fv('phone')}" autocomplete="tel"><label>كلمة السر (8 حروف على الأقل، حروف وأرقام)</label><input type="password" name="password" required dir="ltr" autocomplete="new-password"><label>أعد كتابة كلمة السر</label><input type="password" name="password2" required dir="ltr" autocomplete="new-password"><p><button>إنشاء الحساب</button></p></form>${googleBtn(c, nq)}<p class="muted">عندك حساب؟ <a href="/account/login${nq}">سجلي دخول</a></p></div>`);
+  }
+  if (path === '/account/login') {
+    if (cust) return redirect(next);
+    let err = '';
+    if (form) {
+      const ph = phoneNorm(form.get('phone'));
+      if (!pubCheck(c)) err = 'الصفحة انتهت، حدّثيها وحاولي تاني.';
+      else if (await loginBlocked(c, 'cust', ph)) err = 'محاولات كتير. استني 10 دقايق.';
+      else {
+        const u = await db.prepare('SELECT * FROM customers WHERE phone=? AND active=1').bind(ph).first();
+        if (u && (await checkPass(String(form.get('password') || ''), u.pass_hash))) { await startSession(c, 'csid', 'cust', u.id); return redirect(next); }
+        await loginFail(c, 'cust', ph); err = 'رقم التليفون أو كلمة السر غلط.';
+      }
+    }
+    return L('تسجيل الدخول', `<div class="box narrow"><h2>تسجيل الدخول</h2>${err ? notice(err) : ''}<form method="post">${pubField(c)}${nextF}<label>رقم التليفون</label><input name="phone" required dir="ltr" autocomplete="tel"><label>كلمة السر</label><input type="password" name="password" required dir="ltr" autocomplete="current-password"><p><button>دخول</button></p></form>${googleBtn(c, nq)}<p class="muted">مفيش عندك حساب؟ <a href="/account/register${nq}">أنشئي حساب جديد</a></p></div>`);
+  }
+  if (!cust) return redirect('/account/login?next=' + encodeURIComponent(path === '/account/logout' ? '/' : path));
+  const csrf = `<input type="hidden" name="csrf" value="${esc(cust.csrf)}">`;
+  if (form && form.get('csrf') !== cust.csrf) return html('طلب غير صالح، ارجعي للصفحة وحاولي تاني.', 400);
+  if (path === '/account/logout' && form) { await db.prepare('DELETE FROM sessions WHERE token_hash=?').bind(cust.token_hash).run(); setCookie(c, 'csid', '', 0); return redirect('/'); }
+  if (path === '/account/phone') {
+    let err = '';
+    if (form) {
+      const ph = phoneNorm(form.get('phone'));
+      if (!phoneOk(ph)) err = 'رقم التليفون مش صحيح.';
+      else if (await cnt(db, 'SELECT COUNT(*) FROM customers WHERE phone=? AND id<>?', ph, cust.id)) err = 'الرقم ده مسجل على حساب تاني.';
+      else { await db.prepare('UPDATE customers SET phone=? WHERE id=?').bind(ph, cust.id).run(); return redirect(next); }
+    }
+    return L('رقم التليفون', `<div class="box narrow"><h2>اكتبي رقم تليفونك</h2><p class="muted">محتاجينه عشان نكلمك لتأكيد الطلب والتوصيل.</p>${err ? notice(err) : ''}<form method="post">${csrf}${nextF}<label>رقم التليفون</label><input name="phone" required dir="ltr" autocomplete="tel"><p><button>حفظ</button></p></form></div>`);
+  }
+  let m;
+  if ((m = path.match(/^\/account\/order\/(\d+)$/))) {
+    const o = await db.prepare('SELECT * FROM orders WHERE id=? AND customer_id=?').bind(+m[1], cust.id).first();
+    if (!o) return L('غير موجود', '<div class="box"><p>الطلب مش موجود.</p><a class="btn" href="/account">حسابي</a></div>');
+    const its = (await db.prepare('SELECT * FROM order_items WHERE order_id=?').bind(o.id).all()).results;
+    return L('طلب #' + o.id, `<div class="box narrow"><h2>طلب #${o.id} <span class="badge">${esc(ORDER_LABELS[o.status] || o.status)}</span></h2><p class="muted">${esc(o.created_at)}</p><div class="tbl-wrap"><table><tr><th>المنتج</th><th>السعر</th><th>الكمية</th></tr>${its.map((i) => `<tr><td>${esc(i.name)}</td><td>${money(i.price)}</td><td>${i.qty}</td></tr>`).join('')}</table></div><p>الإجمالي: <b>${money(o.total)}</b></p><p>الدفع: ${esc(o.payment_method)}</p><p>العنوان: ${esc(o.address)}</p>${o.delivery_time ? `<p>موعد التوصيل: ${esc(o.delivery_time)}</p>` : ''}<p>${o.status === 'delivered' ? '<a class="btn gray" href="/return">طلب مرتجع</a> ' : ''}<a class="btn" href="/account">رجوع</a></p></div>`);
+  }
+  if (path === '/account') {
+    let err = '', ok = '';
+    if (form) {
+      const act = String(form.get('act') || '');
+      if (act === 'profile') {
+        const n = str(form.get('name'), 100), p2 = phoneNorm(form.get('phone2')), ad = str(form.get('address'), 500);
+        if (n.split(/\s+/).filter(Boolean).length < 2) err = 'اكتبي اسمك بالكامل (اسمين على الأقل).';
+        else if (p2 && !phoneOk(p2)) err = 'رقم التليفون التاني مش صحيح.';
+        else { await db.prepare('UPDATE customers SET name=?,phone2=?,address=? WHERE id=?').bind(n, p2, ad, cust.id).run(); return back('/account', 'تم حفظ بياناتك.'); }
+      } else if (act === 'pass') {
+        const np = String(form.get('new_pass') || '');
+        if (cust.pass_hash === '!' || !hasPhone(cust)) err = 'حسابك بحساب Google. أضيفي رقم تليفونك الأول وبعدين اطلبي من الإدارة كلمة سر، أو كمّلي بـ Google.';
+        else if (!(await checkPass(String(form.get('cur_pass') || ''), cust.pass_hash))) err = 'كلمة السر الحالية غلط.';
+        else if (!passOkStaff(np) || /^(.)\1+$/.test(np)) err = 'كلمة السر الجديدة 8 حروف على الأقل وفيها حروف وأرقام.';
+        else if (np !== String(form.get('new_pass2') || '')) err = 'كلمتا السر الجديدتان مش متطابقتين.';
+        else { await db.batch([db.prepare('UPDATE customers SET pass_hash=? WHERE id=?').bind(await hashPass(c, np), cust.id), db.prepare("DELETE FROM sessions WHERE kind='cust' AND uid=? AND token_hash<>?").bind(cust.id, cust.token_hash)]); return back('/account', 'تم تغيير كلمة السر.'); }
+      }
+    }
+    const orders = (await db.prepare('SELECT id,total,status,created_at FROM orders WHERE customer_id=? ORDER BY id DESC LIMIT 50').bind(cust.id).all()).results;
+    const fv = (k, d) => esc(form ? form.get(k) : d);
+    return L('حسابي', `<h2>أهلا ${esc(cust.name)}</h2>${err ? notice(err) : ''}<div class="two"><div class="box"><h3>طلباتي</h3>${orders.length ? `<div class="tbl-wrap"><table><tr><th>رقم</th><th>التاريخ</th><th>الإجمالي</th><th>الحالة</th></tr>${orders.map((o) => `<tr><td><a href="/account/order/${o.id}">#${o.id}</a></td><td>${esc(o.created_at)}</td><td>${money(o.total)}</td><td>${esc(ORDER_LABELS[o.status] || o.status)}</td></tr>`).join('')}</table></div>` : '<p class="muted">لسه ما عملتيش طلبات.</p>'}<p><a class="btn" href="/cart">سلتي</a></p></div><div><div class="box"><h3>بياناتي</h3><form method="post">${csrf}<input type="hidden" name="act" value="profile"><label>الاسم بالكامل</label><input name="name" required value="${fv('name', cust.name)}">${hasPhone(cust) ? `<label>رقم الدخول</label><input value="${esc(cust.phone)}" dir="ltr" disabled>` : `<p class="notice">سجلتي بحساب Google${cust.email ? ' (' + esc(cust.email) + ')' : ''}. <a href="/account/phone">أضيفي رقم تليفونك</a> قبل أول طلب.</p>`}<label>رقم تليفون تاني (اختياري)</label><input name="phone2" dir="ltr" value="${fv('phone2', cust.phone2)}"><label>عنوان التوصيل المحفوظ</label><textarea name="address" rows="3">${fv('address', cust.address)}</textarea><p><button>حفظ</button></p></form></div>${cust.pass_hash === '!' ? '' : '<div class="box"><h3>تغيير كلمة السر</h3><form method="post">${csrf}<input type="hidden" name="act" value="pass"><label>كلمة السر الحالية</label><input type="password" name="cur_pass" dir="ltr" required><label>الجديدة</label><input type="password" name="new_pass" dir="ltr" required><label>أعد كتابة الجديدة</label><input type="password" name="new_pass2" dir="ltr" required><p><button>تغيير</button></p></form></div>'}<form method="post" action="/account/logout">${csrf}<button class="gray">تسجيل الخروج</button></form></div></div>`);
+  }
+  return redirect('/account');
 }
 
 // ---------- الإدارة ----------
@@ -651,6 +805,21 @@ async function admin(c) {
   }
 
   // ----- الموظفين -----
+  if (path === '/admin/customers') {
+    if (form) {
+      const id = parseInt(form.get('id') || '0');
+      if (form.get('setpass')) {
+        const p = String(form.get('pw') || '');
+        if (!passOkStaff(p)) return back('/admin/customers', 'كلمة السر 8 حروف على الأقل وفيها حروف وأرقام.');
+        await db.batch([db.prepare('UPDATE customers SET pass_hash=? WHERE id=?').bind(await hashPass(c, p), id), db.prepare("DELETE FROM sessions WHERE kind='cust' AND uid=?").bind(id)]);
+        return back('/admin/customers', 'تم تغيير كلمة سر العميل.');
+      }
+      if (form.get('toggle')) await db.batch([db.prepare('UPDATE customers SET active=1-active WHERE id=?').bind(id), db.prepare("DELETE FROM sessions WHERE kind='cust' AND uid=?").bind(id)]);
+      return redirect('/admin/customers');
+    }
+    const rows = (await db.prepare('SELECT u.*, (SELECT COUNT(*) FROM orders o WHERE o.customer_id=u.id) AS n FROM customers u ORDER BY u.id DESC LIMIT 300').all()).results;
+    return A('العملاء', `<h2>العملاء (${rows.length})</h2><div class="box"><div class="tbl-wrap"><table><tr><th>الاسم</th><th>التليفون</th><th>الطلبات</th><th>التسجيل</th><th>الحالة</th><th></th></tr>${rows.map((r) => `<tr><td>${esc(r.name)}</td><td dir="ltr">${String(r.phone).startsWith('g:') ? 'Google ' + esc(r.email || '') : esc(r.phone)}</td><td>${r.n}</td><td>${esc(r.created_at)}</td><td>${r.active ? 'شغال' : 'موقوف'}</td><td><form method="post">${csrf}<input type="hidden" name="id" value="${r.id}"><button class="sm gray" name="toggle" value="1">${r.active ? 'إيقاف' : 'تفعيل'}</button></form><form method="post" style="display:flex;gap:4px;margin-top:6px">${csrf}<input type="hidden" name="id" value="${r.id}"><input type="password" name="pw" dir="ltr" placeholder="كلمة سر جديدة" style="width:130px"><button class="sm" name="setpass" value="1">تغيير</button></form></td></tr>`).join('') || '<tr><td colspan="6" class="muted">لسه مفيش عملاء.</td></tr>'}</table></div><p class="muted">كلمات سر العملاء متشفرة ومحدش يقدر يشوفها. لو عميل نسي كلمة السر، اكتبي له كلمة سر جديدة من هنا وابعتيهاله، وهو يغيرها من حسابه.</p></div>`);
+  }
   if (path === '/admin/drivers') {
     let err = '';
     if (form) {
@@ -689,6 +858,7 @@ export default {
     try {
       await ensureSchema(c.db);
       for (const r of (await c.db.prepare('SELECT k,v FROM settings').all()).results) c.S[r.k] = r.v;
+      if (!path.startsWith('/admin')) c.cust = await getCustomer(c);
       if (req.method === 'POST') c.form = await req.formData();
       const res = path.startsWith('/admin') ? await admin(c) : path.startsWith('/driver') ? await driverArea(c) : await shop(c);
       for (const ck of c.cookies) res.headers.append('set-cookie', ck);
