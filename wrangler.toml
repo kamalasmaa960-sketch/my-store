@@ -7,5 +7,5 @@ STORE_NAME = "متجر أسماء"
 
 # قاعدة البيانات D1: Cloudflare بتنشئها وتربطها تلقائيا باسم DB عند أول نشر
 [[d1_databases]]
-binding = "f73b263c-1f94-4124-b874-5cd5a26e7cfa"
+binding = "DB"
 database_name = "store-db"
