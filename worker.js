@@ -159,12 +159,19 @@ async function renderBoxes(c, pos) {
 
 // ---------- الزوار ----------
 async function trackVisit(c) {
-  const ua = c.req.headers.get('user-agent') || '';
-  if (!ua || /bot|crawl|spider|slurp|curl|wget|preview|monitor/i.test(ua)) return;
+  const req = c.req; const ua = req.headers.get('user-agent') || '';
+  if (req.method !== 'GET' || !ua || ua.length < 20) return;
+  if (/bot|crawl|spider|slurp|curl|wget|preview|monitor|headless|lighthouse|whatsapp|facebookexternalhit|facebot|telegram|twitter|discord|skype|embedly|python|java\/|go-http|okhttp|axios|node-fetch|httpclient|uptime|pingdom|scanner|checker|fetch/i.test(ua)) return;
+  const sfm = req.headers.get('sec-fetch-mode'); if (sfm && sfm !== 'navigate') return;
+  if (/prefetch|prerender/i.test((req.headers.get('purpose') || '') + (req.headers.get('sec-purpose') || ''))) return;
   const today = cairoNow().slice(0, 10);
-  if (getCookie(c.req, 'vd') === today) return;
-  let vid = getCookie(c.req, 'vid');
-  if (!/^[A-Za-z0-9]{20,40}$/.test(vid)) { vid = randToken(); setCookie(c, 'vid', vid, 86400 * 365); }
+  if (getCookie(req, 'vd') === today) return;
+  let vid = getCookie(req, 'vid');
+  if (!/^[A-Za-z0-9]{20,40}$/.test(vid)) {
+    // بدون كوكي: معرّف يومي من IP والمتصفح عشان نفس الشخص ما يتعدش كذا مرة
+    vid = (await sha256('v1|' + (req.headers.get('cf-connecting-ip') || 'x') + '|' + ua + '|' + today)).replace(/[^A-Za-z0-9]/g, '').slice(0, 30).padEnd(20, 'x');
+    setCookie(c, 'vid', vid, 86400 * 365);
+  }
   await c.db.prepare('INSERT OR IGNORE INTO visits (day,vid) VALUES (?,?)').bind(today, vid).run();
   setCookie(c, 'vd', today, 86400);
 }
@@ -545,6 +552,108 @@ async function account(c) {
   return redirect('/account');
 }
 
+// ---------- تعديل وحذف عام للوحة الإدارة ----------
+const lnk = (t, id) => `<a class="btn sm red" href="/admin/confirm?t=${t}&id=${id}">حذف</a>`;
+const lnkE = (t, id) => `<a class="btn sm gray" href="/admin/edit?t=${t}&id=${id}">تعديل</a>`;
+const DELS = {
+  product: {
+    title: 'منتج', back: '/admin/products',
+    sel: async (db, id) => { const r = await db.prepare('SELECT name FROM products WHERE id=?').bind(id).first(); return r && { label: r.name, warn: [`هيتشال من ${await cnt(db, 'SELECT COUNT(*) FROM cart_items WHERE product_id=?', id)} سلة عملاء.`, `ظاهر في ${await cnt(db, 'SELECT COUNT(*) FROM order_items WHERE product_id=?', id)} بند طلب قديم: الطلبات هتفضل زي ما هي (الاسم والسعر محفوظين)، بس هيتفك الربط بالمنتج.`] }; },
+    run: (db, id) => [db.prepare('UPDATE order_items SET product_id=NULL WHERE product_id=?').bind(id), db.prepare('DELETE FROM cart_items WHERE product_id=?').bind(id), db.prepare('DELETE FROM products WHERE id=?').bind(id)],
+  },
+  category: {
+    title: 'قسم', back: '/admin/categories',
+    sel: async (db, id) => { const r = await db.prepare('SELECT name FROM categories WHERE id=?').bind(id).first(); return r && { label: r.name, warn: [`${await cnt(db, 'SELECT COUNT(*) FROM products WHERE category_id=?', id)} منتج في القسم ده هيبقى بدون قسم (المنتجات نفسها مش هتتحذف).`] }; },
+    run: (db, id) => [db.prepare('UPDATE products SET category_id=NULL WHERE category_id=?').bind(id), db.prepare('DELETE FROM categories WHERE id=?').bind(id)],
+  },
+  order: {
+    title: 'طلب', back: '/admin/orders',
+    sel: async (db, id) => { const r = await db.prepare('SELECT id,customer_name,total,status FROM orders WHERE id=?').bind(id).first(); return r && { label: `طلب #${r.id} - ${r.customer_name} (${money(r.total)})`, warn: [`هيتحذف معاه ${await cnt(db, 'SELECT COUNT(*) FROM order_items WHERE order_id=?', id)} بند و ${await cnt(db, 'SELECT COUNT(*) FROM returns WHERE order_id=?', id)} مرتجع مرتبط بيه.`, 'هيتشال من مبيعات وتقارير المتجر، وهيختفي من سجل طلبات العميل.', 'المخزون مش بيرجع تلقائي، عدّليه من صفحة المنتج لو لازم.'] }; },
+    run: (db, id) => [db.prepare('DELETE FROM order_items WHERE order_id=?').bind(id), db.prepare('DELETE FROM returns WHERE order_id=?').bind(id), db.prepare('DELETE FROM orders WHERE id=?').bind(id)],
+  },
+  return: {
+    title: 'مرتجع', back: '/admin/returns',
+    sel: async (db, id) => { const r = await db.prepare('SELECT r.id,r.order_id,r.amount,r.status FROM returns r WHERE r.id=?').bind(id).first(); return r && { label: `مرتجع #${r.id} للطلب #${r.order_id} (${money(r.amount)})`, warn: [r.status === 'approved' ? 'ده مرتجع مقبول: هيتشال من حسابات التقارير وصافي المبيعات هيزيد، والطلب هيرجع "تم التسليم".' : 'المرتجع ده مش محسوب في التقارير.'] }; },
+    run: (db, id) => [db.prepare("UPDATE orders SET status='delivered' WHERE status='returned' AND id=(SELECT order_id FROM returns WHERE id=?) AND NOT EXISTS (SELECT 1 FROM returns x WHERE x.order_id=(SELECT order_id FROM returns WHERE id=?) AND x.status='approved' AND x.id<>?)").bind(id, id, id), db.prepare('DELETE FROM returns WHERE id=?').bind(id)],
+  },
+  customer: {
+    title: 'عميل', back: '/admin/customers',
+    sel: async (db, id) => { const r = await db.prepare('SELECT name,phone FROM customers WHERE id=?').bind(id).first(); return r && { label: `${r.name} ${String(r.phone).startsWith('g:') ? '(Google)' : r.phone}`, warn: [`حسابه وسلته (${await cnt(db, 'SELECT COUNT(*) FROM cart_items WHERE customer_id=?', id)} بند) وجلساته هيتحذفوا نهائيا، وهيتخرج من الموقع.`, `طلباته (${await cnt(db, 'SELECT COUNT(*) FROM orders WHERE customer_id=?', id)}) هتفضل في الإدارة والتقارير بس من غير ربط بحساب.`] }; },
+    run: (db, id) => [db.prepare('UPDATE orders SET customer_id=NULL WHERE customer_id=?').bind(id), db.prepare('DELETE FROM cart_items WHERE customer_id=?').bind(id), db.prepare("DELETE FROM sessions WHERE kind='cust' AND uid=?").bind(id), db.prepare('DELETE FROM customers WHERE id=?').bind(id)],
+  },
+  driver: {
+    title: 'موظف', back: '/admin/drivers',
+    sel: async (db, id) => { const r = await db.prepare('SELECT name,username FROM drivers WHERE id=?').bind(id).first(); return r && { label: `${r.name} (${r.username})`, warn: [`${await cnt(db, 'SELECT COUNT(*) FROM orders WHERE driver_id=?', id)} طلب معيّن عليه هيتفك التعيين عنهم (الطلبات نفسها مش هتتحذف).`, 'دخوله هيتقفل فورا.'] }; },
+    run: (db, id) => [db.prepare('UPDATE orders SET driver_id=NULL WHERE driver_id=?').bind(id), db.prepare("DELETE FROM sessions WHERE kind='driver' AND uid=?").bind(id), db.prepare('DELETE FROM drivers WHERE id=?').bind(id)],
+  },
+  box: {
+    title: 'لافتة', back: '/admin/boxes',
+    sel: async (db, id) => { const r = await db.prepare('SELECT body FROM boxes WHERE id=?').bind(id).first(); return r && { label: String(r.body).slice(0, 80), warn: ['هتختفي من الموقع.'] }; },
+    run: (db, id) => [db.prepare('DELETE FROM boxes WHERE id=?').bind(id)],
+  },
+  contact: {
+    title: 'وسيلة تواصل', back: '/admin/payments',
+    sel: async (db, id) => { const r = await db.prepare('SELECT kind,value,label FROM contacts WHERE id=?').bind(id).first(); return r && { label: `${r.label || r.kind}: ${r.value}`, warn: ['هتختفي من الموقع.'] }; },
+    run: (db, id) => [db.prepare('DELETE FROM contacts WHERE id=?').bind(id)],
+  },
+  pm: {
+    title: 'رقم دفع', back: '/admin/payments',
+    sel: async (db, id) => { const r = await db.prepare('SELECT label,number FROM payment_methods WHERE id=?').bind(id).first(); return r && { label: `${r.label}: ${r.number}`, warn: ['هيختفي من صفحة إتمام الطلب. الطلبات القديمة محتفظة بطريقة الدفع اللي اتسجلت فيها.'] }; },
+    run: (db, id) => [db.prepare('DELETE FROM payment_methods WHERE id=?').bind(id)],
+  },
+};
+const EDITS = {
+  category: { table: 'categories', title: 'تعديل قسم', back: '/admin/categories', f: [['name', 'اسم القسم', 'text', 100, 1]] },
+  customer: { table: 'customers', title: 'تعديل عميل', back: '/admin/customers', f: [['name', 'الاسم', 'text', 100, 1], ['phone', 'رقم الدخول (التليفون)', 'phone', 20, 1], ['phone2', 'رقم تاني', 'phone', 20, 0], ['address', 'العنوان', 'area', 500, 0]] },
+  driver: { table: 'drivers', title: 'تعديل موظف', back: '/admin/drivers', f: [['name', 'الاسم', 'text', 100, 1], ['username', 'اسم المستخدم (إنجليزي)', 'user', 30, 1], ['phone', 'التليفون', 'phone', 20, 0]] },
+  pm: { table: 'payment_methods', title: 'تعديل رقم دفع', back: '/admin/payments', f: [['label', 'الاسم', 'text', 100, 1], ['number', 'الرقم', 'text', 100, 1]] },
+  order: { table: 'orders', title: 'تعديل بيانات طلب', back: '/admin/orders', f: [['customer_name', 'اسم العميل', 'text', 100, 1], ['phone', 'التليفون', 'phone', 20, 1], ['phone2', 'تليفون تاني', 'phone', 20, 0], ['address', 'العنوان', 'area', 500, 1], ['location', 'الموقع', 'text', 500, 0], ['notes', 'ملاحظات', 'area', 500, 0]] },
+};
+async function adminCrud(c, A, csrf) {
+  const { db, path, url, form } = c;
+  if (path === '/admin/confirm') {
+    const t = url.searchParams.get('t') || '', id = parseInt(url.searchParams.get('id') || '0'); const d = DELS[t];
+    const info = d && id ? await d.sel(db, id) : null;
+    if (!info) return back('/admin', 'العنصر مش موجود.');
+    return A('تأكيد الحذف', `<div class="box narrow"><h2>تأكيد الحذف</h2><p>هتحذفي ${d.title}: <b>${esc(info.label)}</b></p><ul>${info.warn.map((w) => `<li>${esc(w)}</li>`).join('')}</ul><p class="notice err">الحذف نهائي ومفيش رجوع فيه.</p><form method="post" action="/admin/delete" style="display:flex;gap:8px;flex-wrap:wrap">${csrf}<input type="hidden" name="t" value="${esc(t)}"><input type="hidden" name="id" value="${id}"><input type="hidden" name="confirm" value="yes"><button class="red">تأكيد الحذف</button><a class="btn gray" href="${d.back}">إلغاء</a></form></div>`);
+  }
+  if (path === '/admin/delete') {
+    if (!form) return redirect('/admin');
+    const t = String(form.get('t') || ''), id = parseInt(form.get('id') || '0'); const d = DELS[t];
+    if (!d || !id || form.get('confirm') !== 'yes') return back('/admin', 'طلب غير صالح.');
+    if (!(await d.sel(db, id))) return back(d.back, 'العنصر مش موجود.');
+    await db.batch(d.run(db, id));
+    return back(d.back, 'تم الحذف نهائيا.');
+  }
+  if (path === '/admin/edit') {
+    const t = String((form && form.get('t')) || url.searchParams.get('t') || ''), id = parseInt((form && form.get('id')) || url.searchParams.get('id') || '0'); const e = EDITS[t];
+    const row = e && id ? await db.prepare(`SELECT * FROM ${e.table} WHERE id=?`).bind(id).first() : null;
+    if (!row) return back('/admin', 'العنصر مش موجود.');
+    const fields = e.f.filter((x) => !(t === 'customer' && x[0] === 'phone' && !hasPhone(row)));
+    let err = '';
+    if (form) {
+      const vals = {};
+      for (const [k, , type, max, req] of fields) {
+        let v = str(form.get(k), max);
+        if (type === 'phone') v = phoneNorm(v);
+        if (req && !v) err = 'في بيانات ناقصة.';
+        else if (type === 'phone' && v && !phoneOk(v)) err = 'رقم التليفون مش صحيح.';
+        else if (type === 'user' && !userOk(v)) err = 'اسم المستخدم 4 إلى 30 حرف إنجليزي أو أرقام.';
+        vals[k] = v;
+      }
+      if (!err) {
+        try {
+          await db.prepare(`UPDATE ${e.table} SET ${fields.map((x) => x[0] + '=?').join(',')} WHERE id=?`).bind(...fields.map((x) => vals[x[0]]), id).run();
+          if (t === 'driver') await db.prepare("DELETE FROM sessions WHERE kind='driver' AND uid=? AND ?=0").bind(id, 1).run();
+          return back(e.back, 'تم الحفظ.');
+        } catch (ex) { err = /UNIQUE/i.test(String(ex.message)) ? 'القيمة دي مستخدمة قبل كده.' : 'تعذر الحفظ.'; }
+      }
+    }
+    return A(e.title, `<div class="box narrow"><h2>${e.title}</h2>${err ? notice(err) : ''}<form method="post">${csrf}<input type="hidden" name="t" value="${esc(t)}"><input type="hidden" name="id" value="${id}">${fields.map(([k, lab, type]) => { const v = esc(form ? form.get(k) : row[k]); return `<label>${lab}</label>` + (type === 'area' ? `<textarea name="${k}" rows="3">${v}</textarea>` : `<input name="${k}" value="${v}"${type === 'phone' || type === 'user' ? ' dir="ltr"' : ''}>`); }).join('')}<p><button>حفظ</button> <a class="btn gray" href="${e.back}">إلغاء</a></p></form></div>`);
+  }
+  return null;
+}
+
 // ---------- الإدارة ----------
 const IMG_JS = (formId, fileId, hidId, stId, max) => `<script>
 (function(){const inp=document.getElementById('${fileId}'),hid=document.getElementById('${hidId}'),st=document.getElementById('${stId}'),f=document.getElementById('${formId}');
@@ -636,14 +745,15 @@ async function admin(c) {
   }
 
   // ----- الأقسام -----
+  { const cr = await adminCrud(c, A, csrf); if (cr) return cr; }
   if (path === '/admin/categories') {
     if (form) {
-      if (form.get('del')) { const id = parseInt(form.get('del')); await db.batch([db.prepare('UPDATE products SET category_id=NULL WHERE category_id=?').bind(id), db.prepare('DELETE FROM categories WHERE id=?').bind(id)]); }
+      if (false) { const id = parseInt(form.get('del')); await db.batch([db.prepare('UPDATE products SET category_id=NULL WHERE category_id=?').bind(id), db.prepare('DELETE FROM categories WHERE id=?').bind(id)]); }
       else if (str(form.get('name'))) await db.prepare('INSERT INTO categories (name) VALUES (?)').bind(str(form.get('name'), 100)).run();
       return redirect('/admin/categories');
     }
     const cats = (await db.prepare('SELECT * FROM categories ORDER BY name').all()).results;
-    return A('الأقسام', `<h2>الأقسام</h2><div class="box"><form method="post" style="display:flex;gap:8px">${csrf}<input name="name" placeholder="اسم قسم جديد" required><button>إضافة</button></form></div><table>${cats.map((k) => `<tr><td>${esc(k.name)}</td><td><form method="post" onsubmit="return confirm('حذف القسم؟')">${csrf}<button class="sm red" name="del" value="${k.id}">حذف</button></form></td></tr>`).join('')}</table>`);
+    return A('الأقسام', `<h2>الأقسام</h2><div class="box"><form method="post" style="display:flex;gap:8px">${csrf}<input name="name" placeholder="اسم قسم جديد" required><button>إضافة</button></form></div><table>${cats.map((k) => `<tr><td>${esc(k.name)}</td><td>${lnkE('category', k.id)} ${lnk('category', k.id)}</td></tr>`).join('')}</table>`);
   }
 
   // ----- المنتجات -----
@@ -651,7 +761,7 @@ async function admin(c) {
     let err = '';
     if (form) {
       try {
-        if (form.get('del')) { await db.prepare('DELETE FROM products WHERE id=?').bind(parseInt(form.get('del'))).run(); return back('/admin/products', 'تم حذف المنتج.'); }
+        if (false) { await db.prepare('DELETE FROM products WHERE id=?').bind(parseInt(form.get('del'))).run(); return back('/admin/products', 'تم حذف المنتج.'); }
         const id = parseInt(form.get('id') || '0'), name = str(form.get('name'), 200);
         const price = parseFloat(String(form.get('price') || '0').replace(',', '.')); const stock = Math.max(0, parseInt(form.get('stock') || '0') || 0);
         if (!name || !(price >= 0)) throw new Error('اكتبي اسم المنتج وسعر صحيح.');
@@ -671,7 +781,7 @@ async function admin(c) {
     const ed = eid ? await db.prepare('SELECT id,name,description,price,stock,category_id,active,image_url FROM products WHERE id=?').bind(eid).first() : null;
     const cats = (await db.prepare('SELECT * FROM categories ORDER BY name').all()).results;
     const rows = (await db.prepare(`SELECT p.id,p.name,p.price,p.stock,p.active,p.image_url,p.img_v,(p.image_data IS NOT NULL AND p.image_data<>'') AS has_img,k.name cname FROM products p LEFT JOIN categories k ON k.id=p.category_id ORDER BY p.id DESC`).all()).results;
-    return A('المنتجات', `<h2>المنتجات</h2><div class="box"><h3>${ed ? 'تعديل منتج' : 'إضافة منتج'}</h3>${err ? notice(err) : ''}<form method="post" id="pf">${csrf}<input type="hidden" name="id" value="${ed ? ed.id : 0}"><input type="hidden" name="image_data" id="imgdata"><div class="two"><div><label>اسم المنتج</label><input name="name" required value="${esc(ed?.name)}"><label>السعر (ج.م)</label><input name="price" required dir="ltr" value="${esc(ed?.price)}"><label>الكمية بالمخزن</label><input type="number" name="stock" min="0" value="${esc(ed ? ed.stock : 10)}"></div><div><label>القسم</label><select name="category_id"><option value="">بدون قسم</option>${cats.map((k) => `<option value="${k.id}" ${ed?.category_id === k.id ? 'selected' : ''}>${esc(k.name)}</option>`).join('')}</select><label>صورة من جهازك</label><input type="file" id="imgfile" accept="image/*"><div class="muted" id="imgst"></div><label>أو لينك صورة (لو ما اخترتيش ملف)</label><input name="image_url" dir="ltr" placeholder="https://..." value="${esc(ed?.image_url)}"><label style="font-weight:normal"><input type="checkbox" name="active" style="width:auto" ${!ed || ed.active ? 'checked' : ''}> ظاهر في المتجر</label></div></div><label>الوصف</label><textarea name="description" rows="3">${esc(ed?.description)}</textarea><p><button>حفظ</button> ${ed ? '<a class="btn gray" href="/admin/products">إلغاء</a>' : ''}</p></form></div>${IMG_JS('pf', 'imgfile', 'imgdata', 'imgst', 1000)}<div class="tbl-wrap"><table><tr><th></th><th>الاسم</th><th>القسم</th><th>السعر</th><th>المخزون</th><th>الحالة</th><th></th></tr>${rows.map((r) => `<tr><td><img class="thumb" src="${esc(imgSrc(r))}" alt=""></td><td>${esc(r.name)}</td><td>${esc(r.cname || '-')}</td><td>${money(r.price)}</td><td>${r.stock}</td><td>${r.active ? 'ظاهر' : 'مخفي'}</td><td><a class="btn sm gray" href="/admin/products?edit=${r.id}">تعديل</a> <form method="post" style="display:inline" onsubmit="return confirm('حذف المنتج؟')">${csrf}<button class="sm red" name="del" value="${r.id}">حذف</button></form></td></tr>`).join('')}</table></div>`);
+    return A('المنتجات', `<h2>المنتجات</h2><div class="box"><h3>${ed ? 'تعديل منتج' : 'إضافة منتج'}</h3>${err ? notice(err) : ''}<form method="post" id="pf">${csrf}<input type="hidden" name="id" value="${ed ? ed.id : 0}"><input type="hidden" name="image_data" id="imgdata"><div class="two"><div><label>اسم المنتج</label><input name="name" required value="${esc(ed?.name)}"><label>السعر (ج.م)</label><input name="price" required dir="ltr" value="${esc(ed?.price)}"><label>الكمية بالمخزن</label><input type="number" name="stock" min="0" value="${esc(ed ? ed.stock : 10)}"></div><div><label>القسم</label><select name="category_id"><option value="">بدون قسم</option>${cats.map((k) => `<option value="${k.id}" ${ed?.category_id === k.id ? 'selected' : ''}>${esc(k.name)}</option>`).join('')}</select><label>صورة من جهازك</label><input type="file" id="imgfile" accept="image/*"><div class="muted" id="imgst"></div><label>أو لينك صورة (لو ما اخترتيش ملف)</label><input name="image_url" dir="ltr" placeholder="https://..." value="${esc(ed?.image_url)}"><label style="font-weight:normal"><input type="checkbox" name="active" style="width:auto" ${!ed || ed.active ? 'checked' : ''}> ظاهر في المتجر</label></div></div><label>الوصف</label><textarea name="description" rows="3">${esc(ed?.description)}</textarea><p><button>حفظ</button> ${ed ? '<a class="btn gray" href="/admin/products">إلغاء</a>' : ''}</p></form></div>${IMG_JS('pf', 'imgfile', 'imgdata', 'imgst', 1000)}<div class="tbl-wrap"><table><tr><th></th><th>الاسم</th><th>القسم</th><th>السعر</th><th>المخزون</th><th>الحالة</th><th></th></tr>${rows.map((r) => `<tr><td><img class="thumb" src="${esc(imgSrc(r))}" alt=""></td><td>${esc(r.name)}</td><td>${esc(r.cname || '-')}</td><td>${money(r.price)}</td><td>${r.stock}</td><td>${r.active ? 'ظاهر' : 'مخفي'}</td><td><a class="btn sm gray" href="/admin/products?edit=${r.id}">تعديل</a> ${lnk('product', r.id)}</td></tr>`).join('')}</table></div>`);
   }
 
   // ----- الطلبات -----
@@ -689,7 +799,7 @@ async function admin(c) {
     const drivers = (await db.prepare('SELECT id,name FROM drivers WHERE active=1 ORDER BY name').all()).results;
     const orders = (await db.prepare('SELECT * FROM orders ORDER BY id DESC LIMIT 200').all()).results;
     const items = orders.length ? (await db.prepare(`SELECT * FROM order_items WHERE order_id IN (${orders.map(() => '?').join(',')})`).bind(...orders.map((o) => o.id)).all()).results : [];
-    return A('الطلبات', `<h2>الطلبات</h2>${orders.length ? '' : '<p class="muted">مفيش طلبات لسه.</p>'}${orders.map((o) => `<div class="box"><b>طلب #${o.id}</b> <span class="badge">${esc(ORDER_LABELS[o.status] || o.status)}</span> <span class="muted">${esc(o.created_at)}</span><p>${esc(o.customer_name)} - <a href="tel:${esc(o.phone)}" dir="ltr">${esc(o.phone)}</a>${o.phone2 ? ` - <span dir="ltr">${esc(o.phone2)}</span>` : ''}<br>${nl2br(o.address)}${o.location ? `<br>الموقع: ${esc(o.location)}` : ''}${o.notes ? `<br><span class="muted">ملاحظات: ${esc(o.notes)}</span>` : ''}${o.delivery_time ? `<br><span class="muted">موعد التوصيل: ${esc(o.delivery_time)}</span>` : ''}<br><span class="muted">الدفع: ${esc(o.payment_method)}</span>${o.driver_note ? `<br><span class="muted">ملاحظة المندوب: ${esc(o.driver_note)}</span>` : ''}</p><ul>${items.filter((i) => i.order_id === o.id).map((i) => `<li>${esc(i.name)} × ${i.qty} = ${money(i.price * i.qty)}</li>`).join('')}</ul><b>الإجمالي: ${money(o.total)}</b><form method="post" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">${csrf}<input type="hidden" name="id" value="${o.id}"><select name="status" style="width:auto">${Object.entries(ORDER_LABELS).map(([k, v]) => `<option value="${k}" ${k === o.status ? 'selected' : ''}>${v}</option>`).join('')}</select><select name="driver_id" style="width:auto"><option value="0">بدون مندوب</option>${drivers.map((d) => `<option value="${d.id}" ${o.driver_id === d.id ? 'selected' : ''}>${esc(d.name)}</option>`).join('')}</select><label style="margin:0;font-weight:normal">موعد التوصيل:</label><input type="datetime-local" name="delivery_time" value="${esc((o.delivery_time || '').replace(' ', 'T'))}" style="width:auto"><button class="sm">تحديث</button></form></div>`).join('')}`);
+    return A('الطلبات', `<h2>الطلبات</h2>${orders.length ? '' : '<p class="muted">مفيش طلبات لسه.</p>'}${orders.map((o) => `<div class="box"><b>طلب #${o.id}</b> <span class="badge">${esc(ORDER_LABELS[o.status] || o.status)}</span> <span class="muted">${esc(o.created_at)}</span><p>${esc(o.customer_name)} - <a href="tel:${esc(o.phone)}" dir="ltr">${esc(o.phone)}</a>${o.phone2 ? ` - <span dir="ltr">${esc(o.phone2)}</span>` : ''}<br>${nl2br(o.address)}${o.location ? `<br>الموقع: ${esc(o.location)}` : ''}${o.notes ? `<br><span class="muted">ملاحظات: ${esc(o.notes)}</span>` : ''}${o.delivery_time ? `<br><span class="muted">موعد التوصيل: ${esc(o.delivery_time)}</span>` : ''}<br><span class="muted">الدفع: ${esc(o.payment_method)}</span>${o.driver_note ? `<br><span class="muted">ملاحظة المندوب: ${esc(o.driver_note)}</span>` : ''}</p><ul>${items.filter((i) => i.order_id === o.id).map((i) => `<li>${esc(i.name)} × ${i.qty} = ${money(i.price * i.qty)}</li>`).join('')}</ul><b>الإجمالي: ${money(o.total)}</b> ${lnkE('order', o.id)} ${lnk('order', o.id)}<form method="post" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">${csrf}<input type="hidden" name="id" value="${o.id}"><select name="status" style="width:auto">${Object.entries(ORDER_LABELS).map(([k, v]) => `<option value="${k}" ${k === o.status ? 'selected' : ''}>${v}</option>`).join('')}</select><select name="driver_id" style="width:auto"><option value="0">بدون مندوب</option>${drivers.map((d) => `<option value="${d.id}" ${o.driver_id === d.id ? 'selected' : ''}>${esc(d.name)}</option>`).join('')}</select><label style="margin:0;font-weight:normal">موعد التوصيل:</label><input type="datetime-local" name="delivery_time" value="${esc((o.delivery_time || '').replace(' ', 'T'))}" style="width:auto"><button class="sm">تحديث</button></form></div>`).join('')}`);
   }
 
   // ----- المرتجعات -----
@@ -714,7 +824,7 @@ async function admin(c) {
     }
     const st = { requested: 'قيد المراجعة', approved: 'مقبول', rejected: 'مرفوض' };
     const rows = (await db.prepare('SELECT r.*, o.customer_name, o.phone, o.total FROM returns r JOIN orders o ON o.id=r.order_id ORDER BY r.id DESC LIMIT 200').all()).results;
-    return A('المرتجعات', `<h2>المرتجعات</h2><div class="box"><h3>تسجيل مرتجع يدوي</h3><form method="post" style="display:flex;gap:8px;flex-wrap:wrap">${csrf}<input type="hidden" name="create" value="1"><input name="order_id" type="number" placeholder="رقم الطلب" required style="width:140px"><input name="amount" placeholder="المبلغ (فاضي = كل الطلب)" dir="ltr" style="width:200px"><input name="reason" placeholder="السبب" style="flex:1;min-width:160px"><button>تسجيل</button></form></div>${rows.length ? '' : '<p class="muted">مفيش مرتجعات.</p>'}${rows.map((r) => `<div class="box"><b>مرتجع #${r.id}</b> للطلب #${r.order_id} <span class="badge">${esc(st[r.status] || r.status)}</span> <span class="muted">${esc(r.created_at)}</span><p>${esc(r.customer_name)} - <span dir="ltr">${esc(r.phone)}</span><br>السبب: ${esc(r.reason)}<br>المبلغ: ${money(r.amount)} من ${money(r.total)}</p>${r.status === 'requested' ? `<form method="post" style="display:flex;gap:8px;flex-wrap:wrap">${csrf}<input type="hidden" name="id" value="${r.id}"><input name="amount" value="${esc(r.amount)}" dir="ltr" style="width:140px"><button class="sm" name="approve" value="1">قبول</button><button class="sm red" name="reject" value="1">رفض</button></form>` : ''}</div>`).join('')}`);
+    return A('المرتجعات', `<h2>المرتجعات</h2><div class="box"><h3>تسجيل مرتجع يدوي</h3><form method="post" style="display:flex;gap:8px;flex-wrap:wrap">${csrf}<input type="hidden" name="create" value="1"><input name="order_id" type="number" placeholder="رقم الطلب" required style="width:140px"><input name="amount" placeholder="المبلغ (فاضي = كل الطلب)" dir="ltr" style="width:200px"><input name="reason" placeholder="السبب" style="flex:1;min-width:160px"><button>تسجيل</button></form></div>${rows.length ? '' : '<p class="muted">مفيش مرتجعات.</p>'}${rows.map((r) => `<div class="box"><b>مرتجع #${r.id}</b> للطلب #${r.order_id} <span class="badge">${esc(st[r.status] || r.status)}</span> <span class="muted">${esc(r.created_at)}</span><p>${esc(r.customer_name)} - <span dir="ltr">${esc(r.phone)}</span><br>السبب: ${esc(r.reason)}<br>المبلغ: ${money(r.amount)} من ${money(r.total)}</p><p>${lnk('return', r.id)}</p>${r.status === 'requested' ? `<form method="post" style="display:flex;gap:8px;flex-wrap:wrap">${csrf}<input type="hidden" name="id" value="${r.id}"><input name="amount" value="${esc(r.amount)}" dir="ltr" style="width:140px"><button class="sm" name="approve" value="1">قبول</button><button class="sm red" name="reject" value="1">رفض</button></form>` : ''}</div>`).join('')}`);
   }
 
   // ----- التقارير -----
@@ -736,7 +846,7 @@ async function admin(c) {
     const positions = { top: 'أعلى كل الصفحات (شريط إعلان)', home_top: 'الرئيسية - فوق المنتجات', home_bottom: 'الرئيسية - تحت المنتجات', product: 'صفحة المنتج', cart: 'صفحة السلة', checkout: 'صفحة إتمام الطلب', footer: 'أسفل كل الصفحات' };
     let err = '';
     if (form) {
-      if (form.get('del')) { await db.prepare('DELETE FROM boxes WHERE id=?').bind(parseInt(form.get('del'))).run(); return back('/admin/boxes', 'تم الحذف.'); }
+      if (false) { await db.prepare('DELETE FROM boxes WHERE id=?').bind(parseInt(form.get('del'))).run(); return back('/admin/boxes', 'تم الحذف.'); }
       if (form.get('toggle')) { await db.prepare('UPDATE boxes SET active=1-active WHERE id=?').bind(parseInt(form.get('toggle'))).run(); return redirect('/admin/boxes'); }
       const body = str(form.get('body'), 1000), bg = String(form.get('bg_color') || ''), tc = String(form.get('text_color') || ''), pos = String(form.get('position') || ''), link = str(form.get('link'), 500);
       if (!body) err = 'اكتبي النص.'; else if (!colorOk(bg) || !colorOk(tc)) err = 'لون غير صحيح.'; else if (!positions[pos]) err = 'اختاري مكان.';
@@ -750,7 +860,7 @@ async function admin(c) {
     }
     const eid = parseInt(url.searchParams.get('edit') || '0'); const ed = eid ? await db.prepare('SELECT * FROM boxes WHERE id=?').bind(eid).first() : null;
     const rows = (await db.prepare('SELECT * FROM boxes ORDER BY id DESC').all()).results;
-    return A('اللافتات', `<h2>اللافتات الملونة</h2><div class="box"><h3>${ed ? 'تعديل لافتة' : 'إضافة لافتة'}</h3>${err ? notice(err) : ''}<form method="post">${csrf}<input type="hidden" name="id" value="${ed?.id || 0}"><label>النص</label><textarea name="body" rows="2" required>${esc(ed?.body)}</textarea><div class="two"><div><label>لون الخلفية</label><input type="color" name="bg_color" value="${esc(ed?.bg_color || '#5b3df5')}"></div><div><label>لون النص</label><input type="color" name="text_color" value="${esc(ed?.text_color || '#ffffff')}"></div></div><label>المكان</label><select name="position">${Object.entries(positions).map(([k, l]) => `<option value="${k}" ${(ed?.position || 'home_top') === k ? 'selected' : ''}>${l}</option>`).join('')}</select><label>لينك عند الضغط (اختياري)</label><input name="link" dir="ltr" value="${esc(ed?.link)}" placeholder="https://..."><p><button>حفظ</button> ${ed ? '<a class="btn gray" href="/admin/boxes">إلغاء</a>' : ''}</p></form></div>${rows.map((b) => `<div class="box"><div class="banner" style="background:${esc(b.bg_color)};color:${esc(b.text_color)};margin:0 0 10px">${nl2br(b.body)}</div><span class="muted">${esc(positions[b.position] || b.position)} - ${b.active ? 'ظاهرة' : 'مخفية'}</span> <form method="post" style="display:inline">${csrf}<a class="btn sm gray" href="/admin/boxes?edit=${b.id}">تعديل</a> <button class="sm gray" name="toggle" value="${b.id}">إظهار/إخفاء</button> <button class="sm red" name="del" value="${b.id}" onclick="return confirm('حذف؟')">حذف</button></form></div>`).join('')}`);
+    return A('اللافتات', `<h2>اللافتات الملونة</h2><div class="box"><h3>${ed ? 'تعديل لافتة' : 'إضافة لافتة'}</h3>${err ? notice(err) : ''}<form method="post">${csrf}<input type="hidden" name="id" value="${ed?.id || 0}"><label>النص</label><textarea name="body" rows="2" required>${esc(ed?.body)}</textarea><div class="two"><div><label>لون الخلفية</label><input type="color" name="bg_color" value="${esc(ed?.bg_color || '#5b3df5')}"></div><div><label>لون النص</label><input type="color" name="text_color" value="${esc(ed?.text_color || '#ffffff')}"></div></div><label>المكان</label><select name="position">${Object.entries(positions).map(([k, l]) => `<option value="${k}" ${(ed?.position || 'home_top') === k ? 'selected' : ''}>${l}</option>`).join('')}</select><label>لينك عند الضغط (اختياري)</label><input name="link" dir="ltr" value="${esc(ed?.link)}" placeholder="https://..."><p><button>حفظ</button> ${ed ? '<a class="btn gray" href="/admin/boxes">إلغاء</a>' : ''}</p></form></div>${rows.map((b) => `<div class="box"><div class="banner" style="background:${esc(b.bg_color)};color:${esc(b.text_color)};margin:0 0 10px">${nl2br(b.body)}</div><span class="muted">${esc(positions[b.position] || b.position)} - ${b.active ? 'ظاهرة' : 'مخفية'}</span> <form method="post" style="display:inline">${csrf}<a class="btn sm gray" href="/admin/boxes?edit=${b.id}">تعديل</a> <button class="sm gray" name="toggle" value="${b.id}">إظهار/إخفاء</button> ${lnk('box', b.id)}</form></div>`).join('')}`);
   }
 
   // ----- الشكل والإعدادات -----
@@ -788,20 +898,20 @@ async function admin(c) {
           else await db.prepare('INSERT INTO contacts (kind,value,label,sort_order) VALUES (?,?,?,(SELECT COALESCE(MAX(sort_order),0)+1 FROM contacts))').bind(kind, val, lab).run();
           return back('/admin/payments', 'تم حفظ وسيلة التواصل.');
         }
-      } else if (form.get('del_c')) { await db.prepare('DELETE FROM contacts WHERE id=?').bind(parseInt(form.get('del_c'))).run(); return back('/admin/payments', 'تم الحذف.'); }
+      } else if (false) { await db.prepare('DELETE FROM contacts WHERE id=?').bind(parseInt(false)).run(); return back('/admin/payments', 'تم الحذف.'); }
       else if (form.get('toggle_c')) { await db.prepare('UPDATE contacts SET active=1-active WHERE id=?').bind(parseInt(form.get('toggle_c'))).run(); return redirect('/admin/payments'); }
       else if (form.get('add_pm')) {
         const l = str(form.get('label'), 100), n = str(form.get('number'), 100);
         if (!l || !n) return back('/admin/payments', 'اكتبي اسم الوسيلة والرقم.');
         await db.prepare('INSERT INTO payment_methods (label,number) VALUES (?,?)').bind(l, n).run(); return back('/admin/payments', 'تمت الإضافة.');
-      } else if (form.get('del_pm')) { await db.prepare('DELETE FROM payment_methods WHERE id=?').bind(parseInt(form.get('del_pm'))).run(); return back('/admin/payments', 'تم الحذف.'); }
+      } else if (false) { await db.prepare('DELETE FROM payment_methods WHERE id=?').bind(parseInt(false)).run(); return back('/admin/payments', 'تم الحذف.'); }
       else if (form.get('toggle_pm')) { await db.prepare('UPDATE payment_methods SET active=1-active WHERE id=?').bind(parseInt(form.get('toggle_pm'))).run(); return redirect('/admin/payments'); }
     }
     const pms = (await db.prepare('SELECT * FROM payment_methods ORDER BY id').all()).results;
     const cs = (await db.prepare('SELECT * FROM contacts ORDER BY sort_order, id').all()).results;
     const eid = parseInt(url.searchParams.get('edit') || '0'); const ed = eid ? await db.prepare('SELECT * FROM contacts WHERE id=?').bind(eid).first() : null;
     const selKind = ed?.kind || (form ? form.get('kind') : '') || '';
-    return A('الدفع والتواصل', `<h2>الدفع والتواصل</h2><div class="box"><h3>${ed ? 'تعديل وسيلة تواصل' : 'إضافة وسيلة تواصل'}</h3>${err ? notice(err) : ''}<form method="post">${csrf}<input type="hidden" name="save_contact" value="1"><input type="hidden" name="id" value="${ed?.id || 0}"><div class="two"><div><label>النوع</label><select name="kind">${Object.entries(CONTACT_KINDS).map(([k, kv]) => `<option value="${k}" ${selKind === k ? 'selected' : ''}>${kv[0]}</option>`).join('')}</select></div><div><label>الاسم اللي يظهر (اختياري)</label><input name="label" value="${esc(ed?.label)}" placeholder="مثال: كلمينا على واتساب"></div></div><label>الرقم أو الرابط</label><input name="value" dir="ltr" required value="${esc(ed?.value || (form ? form.get('value') : ''))}"><p class="muted">واتساب: رقم بالكود الدولي (201012345678). تيليجرام: اسم المستخدم. فيسبوك: لينك الصفحة. إيميل: العنوان. اتصال: رقم التليفون.</p><p><button>${icon('check', 18)} حفظ</button> ${ed ? '<a class="btn gray" href="/admin/payments">إلغاء</a>' : ''}</p></form>${cs.length ? `<div class="cbtns" style="margin:14px 0">${cs.filter((r) => CONTACT_KINDS[r.kind]).map((r) => `<div class="box" style="margin:0;padding:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap${r.active ? '' : ';opacity:.55'}"><span class="cbtn static" style="--bc:${CONTACT_KINDS[r.kind][1]}">${icon(r.kind, 20)}<span>${esc(r.label || CONTACT_KINDS[r.kind][0])}</span></span><span dir="ltr" class="muted">${esc(r.value)}</span><form method="post" style="display:flex;gap:6px">${csrf}<a class="btn sm gray" href="/admin/payments?edit=${r.id}">تعديل</a><button class="sm gray" name="toggle_c" value="${r.id}">${r.active ? 'إخفاء' : 'إظهار'}</button><button class="sm red" name="del_c" value="${r.id}" onclick="return confirm('حذف؟')">حذف</button></form></div>`).join('')}</div>` : ''}</div><div class="box"><h3>العنوان</h3><form method="post" style="display:flex;gap:8px">${csrf}<input type="hidden" name="save_addr" value="1"><input name="address" value="${esc(setting(c, 'address'))}" placeholder="عنوان المتجر (اختياري)"><button>حفظ</button></form></div><div class="box"><h3>أرقام الدفع (فودافون كاش، إنستاباي...)</h3><form method="post" style="display:flex;gap:8px;flex-wrap:wrap">${csrf}<input type="hidden" name="add_pm" value="1"><input name="label" placeholder="الاسم، مثال: فودافون كاش" style="flex:1;min-width:160px" required><input name="number" placeholder="الرقم" dir="ltr" style="flex:1;min-width:160px" required><button>إضافة</button></form><div class="tbl-wrap" style="margin-top:12px"><table>${pms.map((r) => `<tr><td>${esc(r.label)}</td><td dir="ltr">${esc(r.number)}</td><td>${r.active ? 'ظاهر' : 'مخفي'}</td><td><form method="post" style="display:inline">${csrf}<button class="sm gray" name="toggle_pm" value="${r.id}">إظهار/إخفاء</button> <button class="sm red" name="del_pm" value="${r.id}" onclick="return confirm('حذف؟')">حذف</button></form></td></tr>`).join('')}</table></div><p class="muted">بتظهر للعميل في صفحة إتمام الطلب وأسفل الموقع. الدفع الأونلاين التلقائي مش مفعّل: العميل بيحوّل ويبعتلك الإيصال.</p></div>`);
+    return A('الدفع والتواصل', `<h2>الدفع والتواصل</h2><div class="box"><h3>${ed ? 'تعديل وسيلة تواصل' : 'إضافة وسيلة تواصل'}</h3>${err ? notice(err) : ''}<form method="post">${csrf}<input type="hidden" name="save_contact" value="1"><input type="hidden" name="id" value="${ed?.id || 0}"><div class="two"><div><label>النوع</label><select name="kind">${Object.entries(CONTACT_KINDS).map(([k, kv]) => `<option value="${k}" ${selKind === k ? 'selected' : ''}>${kv[0]}</option>`).join('')}</select></div><div><label>الاسم اللي يظهر (اختياري)</label><input name="label" value="${esc(ed?.label)}" placeholder="مثال: كلمينا على واتساب"></div></div><label>الرقم أو الرابط</label><input name="value" dir="ltr" required value="${esc(ed?.value || (form ? form.get('value') : ''))}"><p class="muted">واتساب: رقم بالكود الدولي (201012345678). تيليجرام: اسم المستخدم. فيسبوك: لينك الصفحة. إيميل: العنوان. اتصال: رقم التليفون.</p><p><button>${icon('check', 18)} حفظ</button> ${ed ? '<a class="btn gray" href="/admin/payments">إلغاء</a>' : ''}</p></form>${cs.length ? `<div class="cbtns" style="margin:14px 0">${cs.filter((r) => CONTACT_KINDS[r.kind]).map((r) => `<div class="box" style="margin:0;padding:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap${r.active ? '' : ';opacity:.55'}"><span class="cbtn static" style="--bc:${CONTACT_KINDS[r.kind][1]}">${icon(r.kind, 20)}<span>${esc(r.label || CONTACT_KINDS[r.kind][0])}</span></span><span dir="ltr" class="muted">${esc(r.value)}</span><form method="post" style="display:flex;gap:6px">${csrf}<a class="btn sm gray" href="/admin/payments?edit=${r.id}">تعديل</a><button class="sm gray" name="toggle_c" value="${r.id}">${r.active ? 'إخفاء' : 'إظهار'}</button>${lnk('contact', r.id)}</form></div>`).join('')}</div>` : ''}</div><div class="box"><h3>العنوان</h3><form method="post" style="display:flex;gap:8px">${csrf}<input type="hidden" name="save_addr" value="1"><input name="address" value="${esc(setting(c, 'address'))}" placeholder="عنوان المتجر (اختياري)"><button>حفظ</button></form></div><div class="box"><h3>أرقام الدفع (فودافون كاش، إنستاباي...)</h3><form method="post" style="display:flex;gap:8px;flex-wrap:wrap">${csrf}<input type="hidden" name="add_pm" value="1"><input name="label" placeholder="الاسم، مثال: فودافون كاش" style="flex:1;min-width:160px" required><input name="number" placeholder="الرقم" dir="ltr" style="flex:1;min-width:160px" required><button>إضافة</button></form><div class="tbl-wrap" style="margin-top:12px"><table>${pms.map((r) => `<tr><td>${esc(r.label)}</td><td dir="ltr">${esc(r.number)}</td><td>${r.active ? 'ظاهر' : 'مخفي'}</td><td><form method="post" style="display:inline">${csrf}<button class="sm gray" name="toggle_pm" value="${r.id}">إظهار/إخفاء</button> ${lnkE('pm', r.id)} ${lnk('pm', r.id)}</form></td></tr>`).join('')}</table></div><p class="muted">بتظهر للعميل في صفحة إتمام الطلب وأسفل الموقع. الدفع الأونلاين التلقائي مش مفعّل: العميل بيحوّل ويبعتلك الإيصال.</p></div>`);
   }
 
   // ----- الموظفين -----
@@ -818,7 +928,7 @@ async function admin(c) {
       return redirect('/admin/customers');
     }
     const rows = (await db.prepare('SELECT u.*, (SELECT COUNT(*) FROM orders o WHERE o.customer_id=u.id) AS n FROM customers u ORDER BY u.id DESC LIMIT 300').all()).results;
-    return A('العملاء', `<h2>العملاء (${rows.length})</h2><div class="box"><div class="tbl-wrap"><table><tr><th>الاسم</th><th>التليفون</th><th>الطلبات</th><th>التسجيل</th><th>الحالة</th><th></th></tr>${rows.map((r) => `<tr><td>${esc(r.name)}</td><td dir="ltr">${String(r.phone).startsWith('g:') ? 'Google ' + esc(r.email || '') : esc(r.phone)}</td><td>${r.n}</td><td>${esc(r.created_at)}</td><td>${r.active ? 'شغال' : 'موقوف'}</td><td><form method="post">${csrf}<input type="hidden" name="id" value="${r.id}"><button class="sm gray" name="toggle" value="1">${r.active ? 'إيقاف' : 'تفعيل'}</button></form><form method="post" style="display:flex;gap:4px;margin-top:6px">${csrf}<input type="hidden" name="id" value="${r.id}"><input type="password" name="pw" dir="ltr" placeholder="كلمة سر جديدة" style="width:130px"><button class="sm" name="setpass" value="1">تغيير</button></form></td></tr>`).join('') || '<tr><td colspan="6" class="muted">لسه مفيش عملاء.</td></tr>'}</table></div><p class="muted">كلمات سر العملاء متشفرة ومحدش يقدر يشوفها. لو عميل نسي كلمة السر، اكتبي له كلمة سر جديدة من هنا وابعتيهاله، وهو يغيرها من حسابه.</p></div>`);
+    return A('العملاء', `<h2>العملاء (${rows.length})</h2><div class="box"><div class="tbl-wrap"><table><tr><th>الاسم</th><th>التليفون</th><th>الطلبات</th><th>التسجيل</th><th>الحالة</th><th></th></tr>${rows.map((r) => `<tr><td>${esc(r.name)}</td><td dir="ltr">${String(r.phone).startsWith('g:') ? 'Google ' + esc(r.email || '') : esc(r.phone)}</td><td>${r.n}</td><td>${esc(r.created_at)}</td><td>${r.active ? 'شغال' : 'موقوف'}</td><td>${lnkE('customer', r.id)} ${lnk('customer', r.id)}<form method="post" style="margin-top:6px">${csrf}<input type="hidden" name="id" value="${r.id}"><button class="sm gray" name="toggle" value="1">${r.active ? 'إيقاف' : 'تفعيل'}</button></form><form method="post" style="display:flex;gap:4px;margin-top:6px">${csrf}<input type="hidden" name="id" value="${r.id}"><input type="password" name="pw" dir="ltr" placeholder="كلمة سر جديدة" style="width:130px"><button class="sm" name="setpass" value="1">تغيير</button></form></td></tr>`).join('') || '<tr><td colspan="6" class="muted">لسه مفيش عملاء.</td></tr>'}</table></div><p class="muted">كلمات سر العملاء متشفرة ومحدش يقدر يشوفها. لو عميل نسي كلمة السر، اكتبي له كلمة سر جديدة من هنا وابعتيهاله، وهو يغيرها من حسابه.</p></div>`);
   }
   if (path === '/admin/drivers') {
     let err = '';
@@ -837,11 +947,11 @@ async function admin(c) {
         await db.batch([db.prepare('UPDATE drivers SET pass_hash=? WHERE id=?').bind(await hashPass(c, p), id), db.prepare("DELETE FROM sessions WHERE kind='driver' AND uid=?").bind(id)]);
         return back('/admin/drivers', 'تم تغيير كلمة السر.');
       } else if (form.get('toggle')) { await db.batch([db.prepare('UPDATE drivers SET active=1-active WHERE id=?').bind(id), db.prepare("DELETE FROM sessions WHERE kind='driver' AND uid=?").bind(id)]); return redirect('/admin/drivers'); }
-      else if (form.get('del')) { await db.batch([db.prepare('UPDATE orders SET driver_id=NULL WHERE driver_id=?').bind(id), db.prepare('DELETE FROM drivers WHERE id=?').bind(id), db.prepare("DELETE FROM sessions WHERE kind='driver' AND uid=?").bind(id)]); return back('/admin/drivers', 'تم حذف الموظف.'); }
+      else if (false) { await db.batch([db.prepare('UPDATE orders SET driver_id=NULL WHERE driver_id=?').bind(id), db.prepare('DELETE FROM drivers WHERE id=?').bind(id), db.prepare("DELETE FROM sessions WHERE kind='driver' AND uid=?").bind(id)]); return back('/admin/drivers', 'تم حذف الموظف.'); }
     }
     const rows = (await db.prepare("SELECT d.*, (SELECT COUNT(*) FROM orders o WHERE o.driver_id=d.id AND o.status IN ('confirmed','shipped','failed')) AS open_orders, (SELECT COUNT(*) FROM orders o WHERE o.driver_id=d.id AND o.status='delivered') AS done FROM drivers d ORDER BY d.id DESC").all()).results;
     const fv = (k) => esc(form ? form.get(k) : '');
-    return A('الموظفين', `<h2>الموظفين (المندوبين والسواقين)</h2><div class="box"><h3>إضافة موظف</h3>${err ? notice(err) : ''}<form method="post">${csrf}<input type="hidden" name="add" value="1"><div class="two"><div><label>الاسم</label><input name="name" required value="${fv('name')}"><label>رقم التليفون (اختياري)</label><input name="phone" dir="ltr" value="${fv('phone')}"></div><div><label>اسم المستخدم (إنجليزي)</label><input name="username" dir="ltr" required value="${fv('username')}"><label>كلمة السر (8 حروف على الأقل، حروف وأرقام)</label><input type="password" name="password" dir="ltr" required></div></div><p><button>إضافة</button></p><p class="muted">الموظف بيدخل من زر "الموظفين" في الصفحة الرئيسية أو من <span dir="ltr">${esc(url.origin)}/driver/login</span>. كلمات السر بتتخزن مشفّرة ومش بتظهر لحد.</p></form></div><div class="tbl-wrap"><table><tr><th>الاسم</th><th>اسم المستخدم</th><th>التليفون</th><th>جارية</th><th>تم تسليمها</th><th>الحالة</th><th></th></tr>${rows.map((r) => `<tr><td>${esc(r.name)}</td><td dir="ltr">${esc(r.username)}</td><td dir="ltr">${esc(r.phone)}</td><td>${r.open_orders}</td><td>${r.done}</td><td>${r.active ? 'شغال' : 'موقوف'}</td><td><form method="post" style="display:flex;gap:6px;flex-wrap:wrap">${csrf}<input type="hidden" name="id" value="${r.id}"><input type="password" name="password" placeholder="كلمة سر جديدة" dir="ltr" style="width:140px"><button class="sm" name="setpass" value="1">تغيير</button><button class="sm gray" name="toggle" value="1">إيقاف/تشغيل</button><button class="sm red" name="del" value="1" onclick="return confirm('حذف الموظف؟')">حذف</button></form></td></tr>`).join('')}</table></div>`);
+    return A('الموظفين', `<h2>الموظفين (المندوبين والسواقين)</h2><div class="box"><h3>إضافة موظف</h3>${err ? notice(err) : ''}<form method="post">${csrf}<input type="hidden" name="add" value="1"><div class="two"><div><label>الاسم</label><input name="name" required value="${fv('name')}"><label>رقم التليفون (اختياري)</label><input name="phone" dir="ltr" value="${fv('phone')}"></div><div><label>اسم المستخدم (إنجليزي)</label><input name="username" dir="ltr" required value="${fv('username')}"><label>كلمة السر (8 حروف على الأقل، حروف وأرقام)</label><input type="password" name="password" dir="ltr" required></div></div><p><button>إضافة</button></p><p class="muted">الموظف بيدخل من زر "الموظفين" في الصفحة الرئيسية أو من <span dir="ltr">${esc(url.origin)}/driver/login</span>. كلمات السر بتتخزن مشفّرة ومش بتظهر لحد.</p></form></div><div class="tbl-wrap"><table><tr><th>الاسم</th><th>اسم المستخدم</th><th>التليفون</th><th>جارية</th><th>تم تسليمها</th><th>الحالة</th><th></th></tr>${rows.map((r) => `<tr><td>${esc(r.name)}</td><td dir="ltr">${esc(r.username)}</td><td dir="ltr">${esc(r.phone)}</td><td>${r.open_orders}</td><td>${r.done}</td><td>${r.active ? 'شغال' : 'موقوف'}</td><td><form method="post" style="display:flex;gap:6px;flex-wrap:wrap">${csrf}<input type="hidden" name="id" value="${r.id}"><input type="password" name="password" placeholder="كلمة سر جديدة" dir="ltr" style="width:140px"><button class="sm" name="setpass" value="1">تغيير</button><button class="sm gray" name="toggle" value="1">إيقاف/تشغيل</button></form> ${lnkE('driver', r.id)} ${lnk('driver', r.id)}</td></tr>`).join('')}</table></div>`);
   }
   return redirect('/admin');
 }
