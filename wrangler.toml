@@ -1,0 +1,11 @@
+name = "my-store"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+
+[vars]
+STORE_NAME = "متجر أسماء"
+
+# قاعدة البيانات D1: Cloudflare بتنشئها وتربطها تلقائيا باسم DB عند أول نشر
+[[d1_databases]]
+binding = "DB"
+database_name = "store-db"
